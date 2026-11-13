@@ -1,8 +1,6 @@
 # OnePyProject
 
-An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The editable OnePyProject plan (`.pxplan`) is separate from MPP interchange.
-
-Existing ProjectX `.pxplan` files remain compatible; their historical internal format identifier is intentionally retained. Personal plans and MPP templates are excluded from the repository.
+An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The editable OnePyProject plan (`.pxplan`) is separate from `MPP` interchange that can also be read and written.
 
 ## Run from source
 
@@ -35,7 +33,7 @@ Application preferences, including toolbar names, row density, date format, keyb
 - pymppwriter is alpha software. MPP import and export are **lossy** and have not yet been verified in Microsoft Project. Resource names, maximum units and multiple positive-percentage assignments are imported and exported; fixed-units tasks are approximated as fixed-duration, and zero-percentage assignments are reported and omitted. All four dependency types and working lags can be written; working lags are exported as days. MPP export refuses nonzero elapsed or percentage lags because pymppwriter cannot preserve their units. Import omits nonzero lags whose units the reader cannot safely identify and reports them. The reader can also omit unscheduled tasks and does not fully read calendars or task types. Resource calendars, rates, costs, progress, timephased data, summary-task dependencies, constraints, baselines, custom data and other Project features are not preserved in the OnePyProject model. Import reports some known omissions, not necessarily all losses. Keep the source MPP unchanged and verify exported files in Microsoft Project before relying on them.
 - MPP export requires a user-supplied `template.mpp`, which is not included in the repository. OnePyProject removes its resource records before generating a new MPP, but pymppwriter retains other template streams, so exports may still include hidden project data, names, metadata, or other private information. Use a suitably licensed, minimal template and audit exports before distribution. Do not assume that deleting visible tasks removes hidden data.
 - The Gantt view supports at most 5,000 days of timeline from its start. Time and dates are local wall-clock values, with no timezone conversions.
-- The free Qt/PySide6 distribution has LGPL/GPL obligations. Check all licences and how to comply before distributing a packaged application; signing and notarization can have separate costs.
+
 
 ## Tests
 
@@ -56,5 +54,9 @@ To build locally in a clean Python 3.12 environment on the target OS and archite
 The CI smoke test checks plan saving, the window and SVG icons, but cannot test MPP import/export without a template. To include that local check, set `ONEPYPROJECT_SMOKE_MPP_TEMPLATE` to your external template's absolute path before running `package_artifact.py`; the test writes a disposable MPP in a temporary directory and checks that the template remains unchanged.
 
 The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. Before distribution, choose the application's own licence and review all bundled third-party licences, required notices and corresponding source, library replacement, signing and notarization. See `packaging/THIRD_PARTY_NOTICES.md`; it is not a complete compliance inventory. Keep `template.mpp` external and select it at export time.
+
+## License
+
+The free Qt/PySide6 distribution has LGPL/GPL obligations. Check all licences and how to comply before distributing a packaged application; signing and notarization can have separate costs.
 
 Toolbar artwork uses [Icons8 Flat Color Icons](https://github.com/icons8/flat-color-icons), under the MIT licence option. The included attribution and licence are in `onepyproject/assets/flat_color_icons/LICENSE.txt`.
