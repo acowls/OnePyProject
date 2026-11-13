@@ -1,0 +1,49 @@
+name: Private desktop builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+            architecture: arm64
+          - target: macos-x64
+            runner: macos-15-intel
+            architecture: x64
+          - target: windows-x64
+            runner: windows-2022
+            architecture: x64
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.architecture }}
+      - name: Install clean build dependencies
+        run: python -m pip install -e '.[dev]' -r packaging/requirements-build.txt
+      - name: Test source
+        run: python -m pytest -q
+      - name: Build application
+        run: python -m PyInstaller --noconfirm packaging/OnePyProject.spec
+      - name: Package and test extracted application
+        run: python packaging/package_artifact.py ${{ matrix.target }}
+      - name: Upload private test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePyProject-${{ matrix.target }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 7

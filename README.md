@@ -47,6 +47,14 @@ The optional integration test uses `template.mpp` if present and writes only to 
 
 ## Packaging
 
-PyInstaller can bundle the application, but builds must be produced and tested separately on Windows and macOS. Include the bundled SVG icon assets and Qt's SVG icon plugin so icons scale correctly. Bundling, platform signing, LGPL compliance, and template redistribution rights have not yet been validated. Keep `template.mpp` external and select it at export time.
+The manual **Private desktop builds** GitHub Actions workflow builds macOS Apple Silicon, macOS Intel and Windows x64 separately. Once the workflow is committed and pushed, run it from the repository's Actions tab and download the matching artifact. Private-repository runner and artifact usage may incur charges. The macOS builds require macOS 14 or newer. The Windows build runs its automated checks on a Windows Server runner; it still needs testing on Windows 11.
+
+Each artifact contains a ZIP: extract it fully, then open `OnePyProject.app` on macOS or `OnePyProject/OnePyProject.exe` on Windows. The app is not signed with a developer identity or notarized, so operating-system security warnings are expected. These are **private test builds, not public releases**. No installer is provided.
+
+To build locally in a clean Python 3.12 environment on the target OS and architecture, install `python -m pip install -e '.[dev]' -r packaging/requirements-build.txt`, run `python -m PyInstaller --noconfirm packaging/OnePyProject.spec`, then run `python packaging/package_artifact.py TARGET` with `macos-arm64`, `macos-x64` or `windows-x64`. The script checks for personal plans and templates, archives the app and runs a noninteractive smoke test on the extracted build. The pinned main build dependencies do not constitute a complete reproducible lockfile.
+
+The CI smoke test checks plan saving, the window and SVG icons, but cannot test MPP import/export without a template. To include that local check, set `ONEPYPROJECT_SMOKE_MPP_TEMPLATE` to your external template's absolute path before running `package_artifact.py`; the test writes a disposable MPP in a temporary directory and checks that the template remains unchanged.
+
+The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. Before distribution, choose the application's own licence and review all bundled third-party licences, required notices and corresponding source, library replacement, signing and notarization. See `packaging/THIRD_PARTY_NOTICES.md`; it is not a complete compliance inventory. Keep `template.mpp` external and select it at export time.
 
 Toolbar artwork uses [Icons8 Flat Color Icons](https://github.com/icons8/flat-color-icons), under the MIT licence option. The included attribution and licence are in `onepyproject/assets/flat_color_icons/LICENSE.txt`.

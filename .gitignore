@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+artifacts/
 *.egg-info/
 .DS_Store
 .env
