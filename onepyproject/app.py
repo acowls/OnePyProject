@@ -1,0 +1,1171 @@
+"""Qt desktop interface for the experimental OnePyProject planner."""
+from __future__ import annotations
+
+import copy
+from datetime import date, datetime, timedelta
+import math
+from pathlib import Path
+import sys
+
+from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTimer, QItemSelectionModel, QSettings
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtCore import QPointF
+
+from .model import Plan, Task, descendants, estimated_tasks, indent, load_plan, outdent, save_plan, schedule
+from .dependencies import parse_dependency, parse_predecessors
+from .icons import toolbar_icon
+from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
+from .resources import format_task_resources, migrate_legacy_resources, overallocation_warnings, set_task_resources
+from .resource_ui import AssignResourcesDialog, ResourceSheetDialog
+from .resource_completion import ResourceCompleter
+from .ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS
+from .preferences import application_preferences
+
+
+DATE_FORMATS = ("system", "short", "long")
+MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+EMPTY_ROW_HINT = "Double-click or press Enter to add a task, Shift+Enter to insert"
+
+
+def display_time(value: datetime, date_format: str = "system", include_time: bool = True) -> str:
+    if date_format == "short":
+        text = f"{value.day:02d}{MONTH_NAMES[value.month - 1]}"
+    elif date_format == "long":
+        text = value.strftime("%Y-%m-%d")
+    else:
+        text = QLocale.system().toString(QDate(value.year, value.month, value.day), QLocale.FormatType.ShortFormat)
+    if not include_time:
+        return text
+    if date_format == "system":
+        locale = QLocale.system()
+        clock = QTime(value.hour, value.minute, value.second)
+        style = QLocale.FormatType.LongFormat if value.second or value.microsecond else QLocale.FormatType.ShortFormat
+        clock_text = locale.toString(clock, style)
+        if value.microsecond:
+            clock_text += f" (+0.{value.microsecond:06d}s)"
+    else:
+        clock_text = value.strftime("%H:%M")
+        if value.second or value.microsecond:
+            clock_text += value.strftime(":%S")
+            if value.microsecond:
+                clock_text += f".{value.microsecond:06d}".rstrip("0")
+    return f"{text} {clock_text}"
+
+
+class TaskTree(QTreeWidget):
+    """Keyboard shortcuts apply to rows, not to text being edited."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.placeholder = None
+        self.insertion = None
+        self.insertion_before = None
+        self.duration_editor = None
+
+    def event(self, event):
+        if event.type() == QEvent.Type.KeyPress and self.state() != QAbstractItemView.State.EditingState:
+            key = event.key()
+            modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+            if (self.window.digit_edits_duration and modifiers in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier)
+                    and Qt.Key.Key_0 <= key <= Qt.Key.Key_9 and event.text() in "0123456789"
+                    and len(event.text()) == 1 and self.window.selected_uid() is not None):
+                self.edit_duration_from_digit(event.text())
+                return True
+            if modifiers in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier):
+                if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+                    if key == Qt.Key.Key_Backtab or modifiers == Qt.KeyboardModifier.ShiftModifier:
+                        self.window.outdent_task()
+                    else:
+                        self.window.indent_task()
+                    return True
+                if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and modifiers == Qt.KeyboardModifier.NoModifier:
+                    self.window.delete_task()
+                    return True
+                if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and modifiers == Qt.KeyboardModifier.ShiftModifier
+                        and self.window.selected_uid() is not None):
+                    self.insert_above_current()
+                    return True
+                if modifiers == Qt.KeyboardModifier.NoModifier:
+                    if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.currentItem() in (None, self.placeholder, self.insertion):
+                        item = self.insertion if self.currentItem() is self.insertion and self.insertion else self.placeholder
+                        if item is not None:
+                            self.setCurrentItem(item, 1)
+                            self.editItem(item, 1)
+                        return True
+                    if key == Qt.Key.Key_Insert and self.window.selected_uid() is not None:
+                        self.insert_above_current()
+                        return True
+        return super().event(event)
+
+    def edit_duration_from_digit(self, digit):
+        uid = self.window.selected_uid()
+        task = next((task for task in self.window.plan.tasks if task.uid == uid), None)
+        if task is None:
+            return
+        if not self.window.can_edit_cell(task, 2):
+            self.window.statusBar().showMessage("Duration is calculated for summary or fixed-work tasks.", 5000)
+            return
+        node = self.window.items[uid]
+        self.duration_editor = None
+        self.setCurrentItem(node, 2)
+        self.editItem(node, 2)
+        editor = self.duration_editor
+        self.duration_editor = None
+        if editor is not None:
+            editor.setText(digit)
+            editor.setCursorPosition(len(digit))
+            editor.setFocus()
+
+    def viewportEvent(self, event):
+        if (event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.state() != QAbstractItemView.State.EditingState and self.placeholder is not None
+                and self.itemAt(event.position().toPoint()) is None):
+            self.setCurrentItem(self.placeholder, 1)
+            return True
+        if (event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton
+                and self.state() != QAbstractItemView.State.EditingState and self.placeholder is not None):
+            item = self.itemAt(event.position().toPoint())
+            if item is None or item is self.placeholder:
+                self.setCurrentItem(self.placeholder, 1)
+                self.editItem(self.placeholder, 1)
+                return True
+        return super().viewportEvent(event)
+
+    def insert_above_current(self):
+        uid = self.window.selected_uid()
+        node = self.window.items.get(uid)
+        if node is None or self.insertion is not None:
+            return
+        parent = node.parent()
+        item = QTreeWidgetItem(["", "New task…"])
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        item.setForeground(1, QColor("#748399"))
+        if parent:
+            parent.insertChild(parent.indexOfChild(node), item)
+        else:
+            self.insertTopLevelItem(self.indexOfTopLevelItem(node), item)
+        self.insertion, self.insertion_before = item, uid
+        self.setCurrentItem(item, 1)
+        self.editItem(item, 1)
+
+    def editor_closed(self, *_):
+        item = self.insertion
+        if item is not None:
+            QTimer.singleShot(0, lambda: self.remove_insertion(item))
+
+    def remove_insertion(self, item):
+        if self.insertion is not item:
+            return
+        was_current = self.currentItem() is item
+        before = self.insertion_before
+        parent = item.parent()
+        if parent:
+            parent.removeChild(item)
+        else:
+            self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+        self.insertion = self.insertion_before = None
+        if was_current and before in self.window.items:
+            self.setCurrentItem(self.window.items[before], 1)
+
+
+class TaskDelegate(QStyledItemDelegate):
+    """Edit supported cells, while keeping calculated cells read-only."""
+
+    def __init__(self, window):
+        super().__init__(window.tree)
+        self.window = window
+
+    def eventFilter(self, editor, event):
+        if isinstance(editor, QLineEdit) and isinstance(editor.completer(), ResourceCompleter):
+            completer = editor.completer()
+            if (event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+                    and completer.popup().isVisible()
+                    and completer.move_selection(1 if event.key() == Qt.Key.Key_Down else -1)):
+                return True
+            if (event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab)
+                    and completer.popup().isVisible() and completer.accept_current()):
+                return True
+            if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape and completer.popup().isVisible():
+                completer.dismiss()
+                return True
+            if event.type() == QEvent.Type.FocusOut and completer.accepting:
+                return True
+        return super().eventFilter(editor, event)
+
+    def createEditor(self, parent, option, index):
+        uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
+        if uid is None and index.column() == 1:
+            return QLineEdit(parent)
+        task = next((t for t in self.window.plan.tasks if t.uid == uid), None)
+        if task is None or not self.window.can_edit_cell(task, index.column()):
+            return None
+        if index.column() == 8:
+            editor = QComboBox(parent)
+            editor.addItem("Duration", "duration")
+            editor.addItem("Work", "work")
+            return editor
+        editor = QLineEdit(parent)
+        if index.column() == 2:
+            self.window.tree.duration_editor = editor
+        elif index.column() == 6:
+            completer = ResourceCompleter(editor, [resource.name for resource in self.window.plan.resources])
+            editor.setCompleter(completer)
+            # QLineEdit normally previews a highlighted completion by replacing
+            # the whole field and moving the cursor. That breaks token editing.
+            # Our completer applies a choice only when it is accepted instead.
+            QTimer.singleShot(0, completer.disable_inline_preview)
+        return editor
+
+    def setEditorData(self, editor, index):
+        uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
+        if uid is None:
+            editor.clear()
+            editor.setPlaceholderText("New task name")
+            return
+        task = next(t for t in self.window.plan.tasks if t.uid == uid)
+        column = index.column()
+        if column == 8:
+            editor.setCurrentIndex(editor.findData(task.mode))
+            return
+        values = {1: task.name, 2: f"{task.duration}{'?' if task.estimated else ''}",
+                  3: task.earliest or self.window.calculated[uid].start.date().isoformat(),
+                  5: ", ".join(map(str, task.predecessors)), 6: format_task_resources(self.window.plan, task), 7: str(task.work)}
+        editor.setText(values[column])
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):
+        uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
+        column = index.column()
+        value = editor.currentData() if column == 8 else editor.text()
+        current_plan = self.window.plan
+        row = self.window.tree.itemFromIndex(index)
+        before = self.window.tree.insertion_before if row is self.window.tree.insertion else None
+        # Rebuilding a tree while Qt is still closing its editor is unsafe.
+        def commit():
+            if self.window.plan is not current_plan:
+                return
+            if uid is None:
+                self.window.add_inline_task(value, before)
+            else:
+                self.window.edit_cell(uid, column, value)
+        QTimer.singleShot(0, commit)
+
+
+class TaskDialog(QDialog):
+    def __init__(self, task: Task, plan: Plan, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Task {task.uid}")
+        self.resize(430, 350)
+        self.initial_mode = task.mode
+        calculated = schedule(plan).get(task.uid) if any(other.uid == task.uid for other in plan.tasks) else None
+        self.display_duration = calculated.duration if calculated and task.mode == "work" else task.duration
+        has_resources = bool(task.resource.strip() or task.assignments)
+        self.display_work = calculated.work if calculated and task.mode == "duration" and has_resources else task.work
+        self.duration_changed = False
+        self.work_changed = False
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        layout.addLayout(form)
+        self.name = QLineEdit(task.name)
+        self.earliest = QLineEdit(task.earliest)
+        self.earliest.setPlaceholderText("YYYY-MM-DD; blank uses project start")
+        self.mode = QComboBox()
+        self.mode.addItem("Fixed duration", "duration")
+        self.mode.addItem("Fixed work", "work")
+        self.mode.setCurrentIndex(1 if task.mode == "work" else 0)
+        self.duration = QDoubleSpinBox()
+        self.duration.setRange(0, 100000)
+        self.duration.setDecimals(2)
+        self.duration.setValue(self.display_duration)
+        self.duration.setSuffix(" days")
+        self.duration.valueChanged.connect(lambda _value: setattr(self, "duration_changed", True))
+        self.estimated = QCheckBox("Estimated duration (?)")
+        self.estimated.setChecked(task.estimated)
+        self.work = QDoubleSpinBox()
+        self.work.setRange(0, 800000)
+        self.work.setDecimals(2)
+        self.work.setValue(self.display_work)
+        self.work.setSuffix(" hours")
+        self.work.valueChanged.connect(lambda _value: setattr(self, "work_changed", True))
+        self.resource = QLineEdit(format_task_resources(plan, task))
+        self.resource.setPlaceholderText("Ada[50%], Ben")
+        self.summary = any(other.parent == task.uid for other in plan.tasks)
+        if self.summary:
+            self.resource.setReadOnly(True)
+            self.resource.setToolTip("Summary assignments cannot be added; use Assign to remove existing ones.")
+        self.predecessors = QLineEdit(", ".join(map(str, task.predecessors)))
+        self.predecessors.setPlaceholderText("e.g. 5FS+2d, 6SS-1d")
+        for label, widget in (("Name", self.name), ("Earliest start", self.earliest),
+                              ("Scheduling", self.mode), ("Duration", self.duration), ("Estimate", self.estimated),
+                              ("Work", self.work), ("Resources", self.resource), ("Predecessors", self.predecessors)):
+            form.addRow(label, widget)
+        hint = QLabel("A duration or work of 0 creates a milestone. Summary dates are calculated from children.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def apply(self, task: Task, plan: Plan) -> None:
+        task.name = self.name.text().strip()
+        task.earliest = self.earliest.text().strip()
+        task.mode = self.mode.currentData()
+        if self.duration_changed:
+            task.duration = self.duration.value()
+        elif self.initial_mode == "work" and task.mode == "duration":
+            task.duration = self.display_duration
+        task.estimated = self.estimated.isChecked()
+        if self.work_changed:
+            task.work = self.work.value()
+        elif self.initial_mode == "duration" and task.mode == "work":
+            task.work = self.display_work
+        if not self.summary:
+            set_task_resources(plan, task, self.resource.text())
+        task.predecessors = parse_predecessors(self.predecessors.text())
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, plan: Plan, parent=None, digit_edits_duration=True, date_format="system",
+                 show_icon_labels=False, settings_location=""):
+        super().__init__(parent)
+        self.setWindowTitle("Project settings")
+        self.resize(420, 180)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.title = QLineEdit(plan.title)
+        self.start = QLineEdit(plan.start)
+        self.holidays = QLineEdit(", ".join(plan.holidays))
+        self.holidays.setPlaceholderText("YYYY-MM-DD, YYYY-MM-DD")
+        form.addRow("Project name", self.title)
+        form.addRow("Start date", self.start)
+        form.addRow("Holidays", self.holidays)
+        self.digit_edits_duration = QCheckBox("Type digits on a task to edit its duration")
+        self.digit_edits_duration.setChecked(digit_edits_duration)
+        form.addRow("Keyboard", self.digit_edits_duration)
+        self.show_icon_labels = QCheckBox("Show toolbar icon names")
+        self.show_icon_labels.setChecked(show_icon_labels)
+        form.addRow("Toolbar", self.show_icon_labels)
+        self.date_format = QComboBox()
+        self.date_format.addItem("System (default)", "system")
+        self.date_format.addItem("11Nov HH:MM", "short")
+        self.date_format.addItem("YYYY-MM-DD HH:MM", "long")
+        self.date_format.setCurrentIndex(max(0, self.date_format.findData(date_format)))
+        form.addRow("Date format", self.date_format)
+        self.settings_location = QLineEdit(settings_location)
+        self.settings_location.setReadOnly(True)
+        self.settings_location.setCursorPosition(0)
+        self.settings_location.setToolTip("Application preferences are stored separately from the project file.\n" + settings_location)
+        form.addRow("Preferences location", self.settings_location)
+        layout.addLayout(form)
+        hint = QLabel("Working time: Monday–Friday, 08:00–12:00 and 13:00–17:00.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class CalendarScrollArea(QScrollArea):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        window = getattr(self, "window", None)
+        if window is not None and hasattr(window, "gantt"):
+            window.gantt.sync()
+
+
+class Gantt(QWidget):
+    DAY = 26
+
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self.window = window
+        self.origin = date.today()
+        self.days = 90
+        self.setMinimumHeight(150)
+
+    def sync(self):
+        values = list(self.window.calculated.values())
+        if values:
+            self.origin = min(v.start.date() for v in values) - timedelta(days=7)
+            finish = max(v.finish.date() for v in values) + timedelta(days=21)
+            self.days = max(90, (finish - self.origin).days + 1)
+        else:
+            self.origin = date.fromisoformat(self.window.plan.start) - timedelta(days=7)
+            self.days = 90
+        # Fill the viewport even when zoomed out on a short project.
+        viewport_width = self.window.chart_area.viewport().width()
+        self.days = max(self.days, math.ceil(viewport_width / self.DAY) + 14)
+        # Qt widget dimensions have an upper limit.
+        self.days = min(self.days, 5000)
+        self.resize(self.days * self.DAY, max(150, self.window.tree.height()))
+        self.update()
+
+    def x(self, point: datetime) -> float:
+        return ((point.date() - self.origin).days + (point.hour * 60 + point.minute) / 1440) * self.DAY
+
+    def date_label(self, day: date) -> str:
+        if self.DAY >= 9 and day.weekday() == 0:
+            return day.strftime("%d %b")
+        if 6 <= self.DAY < 9 and day.weekday() == 0 and day.isocalendar().week % 2 == 0:
+            return day.strftime("%d %b")
+        if self.DAY < 6 and day.day == 1:
+            return day.strftime("%b %Y")
+        return ""
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(event.rect(), QColor("#ffffff"))
+        tree = self.window.tree
+        header = tree.header().height()
+        p.fillRect(0, 0, self.width(), header, QColor("#f4f6f9"))
+        clip = event.rect()
+        first = max(0, clip.left() // self.DAY)
+        last = min(self.days, clip.right() // self.DAY + 2)
+        for n in range(first, last):
+            day = self.origin + timedelta(days=n)
+            x = n * self.DAY
+            if day.weekday() >= 5:
+                p.fillRect(x, header, self.DAY, self.height() - header, QColor("#f6f7f9"))
+            p.setPen(QPen(QColor("#e9edf2"), 1))
+            p.drawLine(x, header, x, self.height())
+            label = self.date_label(day)
+            if label:
+                p.setPen(QColor("#68788c"))
+                p.drawText(x + 3, 19, label)
+        today = (date.today() - self.origin).days * self.DAY
+        p.setPen(QPen(QColor("#55a378"), 1, Qt.PenStyle.DashLine))
+        p.drawLine(today, header, today, self.height())
+
+        positions = {}
+        for uid, tree_item in self.window.items.items():
+            rect = tree.visualItemRect(tree_item)
+            if rect.isEmpty():
+                continue
+            y = header + rect.center().y()
+            item = self.window.calculated[uid]
+            start, finish = self.x(item.start), self.x(item.finish)
+            positions[uid] = (start, finish, y)
+            p.setPen(QPen(QColor("#e9edf2"), 1))
+            p.drawLine(0, header + rect.bottom(), self.width(), header + rect.bottom())
+            if item.summary:
+                p.setPen(QPen(QColor("#343c49"), 3))
+                p.drawLine(int(start), int(y - 3), int(max(start + 2, finish)), int(y - 3))
+                p.drawLine(int(start), int(y - 3), int(start), int(y + 4))
+                p.drawLine(int(finish), int(y - 3), int(finish), int(y + 4))
+            elif item.duration == 0:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#344d69"))
+                p.drawPolygon(QPolygonF([QPointF(start, y - 6), QPointF(start + 6, y),
+                                         QPointF(start, y + 6), QPointF(start - 6, y)]))
+            else:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#72a9e0"))
+                p.drawRoundedRect(QRectF(start, y - 6, max(5, finish - start), 12), 2, 2)
+        # Draw FS links for visible rows, without affecting bar hit testing.
+        p.setPen(QPen(QColor("#5484b7"), 1))
+        for task in self.window.plan.tasks:
+            if task.uid not in positions:
+                continue
+            sx, sf, sy = positions[task.uid]
+            for pred in task.predecessors:
+                link = parse_dependency(pred)
+                if link.uid not in positions:
+                    continue
+                ps, pf, py = positions[link.uid]
+                px = pf if link.kind in ("FS", "FF") else ps
+                endpoint = sx if link.kind in ("FS", "SS") else sf
+                elbow = max(px + 7, endpoint - 8)
+                p.drawLine(int(px), int(py), int(elbow), int(py))
+                p.drawLine(int(elbow), int(py), int(elbow), int(sy))
+                p.drawLine(int(elbow), int(sy), int(endpoint), int(sy))
+        p.end()
+
+
+class MainWindow(QMainWindow):
+    ZOOM_STEPS = (5, 8, 13, 18, 26)
+
+    def __init__(self, preferences=None):
+        super().__init__()
+        self.preferences = preferences if preferences is not None else application_preferences()
+        self.digit_edits_duration = self.preferences.value("keyboard/digit_edits_duration", True, type=bool)
+        self.show_icon_labels = self.preferences.value("display/show_icon_labels", False, type=bool)
+        self.date_format = self.preferences.value("display/date_format", "system", type=str)
+        if self.date_format not in DATE_FORMATS:
+            self.date_format = "system"
+        self.density = self.preferences.value("display/density", DEFAULT_DENSITY, type=str)
+        if self.density not in DENSITY_HEIGHTS:
+            self.density = DEFAULT_DENSITY
+        self.plan = Plan()
+        self.calculated = {}
+        self.items: dict[int, QTreeWidgetItem] = {}
+        self.plan_path: Path | None = None
+        self.import_path: Path | None = None
+        self.template = Path.cwd() / "template.mpp"
+        self.dirty = False
+        self._saved_plan: Plan | None = copy.deepcopy(self.plan)
+        self._undo: list[tuple[Plan, list[int]]] = []
+        self._redo: list[tuple[Plan, list[int]]] = []
+        saved_zoom = self.preferences.value("display/zoom_width", 26, type=int)
+        self.zoom_index = self.ZOOM_STEPS.index(saved_zoom) if saved_zoom in self.ZOOM_STEPS else self.ZOOM_STEPS.index(26)
+        self.setWindowTitle("OnePyProject")
+        self.resize(1450, 800)
+
+        self.file_toolbar = QToolBar("File")
+        self.task_toolbar = QToolBar("Project")
+        for toolbar in (self.file_toolbar, self.task_toolbar):
+            toolbar.setMovable(False)
+            toolbar.setIconSize(QSize(20, 20))
+            toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        file_actions = (("New", self.new_plan, "new"), ("Open", self.open_plan, "open"),
+                        ("Save", self.save, "save"), ("Save As", self.save_as, "save_as"),
+                        ("Import", self.open_mpp, "import"), ("Export", self.save_mpp, "export"))
+        task_actions = (("Settings", self.settings, "settings"), ("Resources", self.manage_resources, "resources"),
+                        ("Assign", self.assign_resources, "assign"), ("+ Task", self.add_task, "task"), ("Edit", self.edit_task, "edit"),
+                        ("Delete", self.delete_task, "delete"), ("Undo", self.undo, "undo"),
+                        ("Redo", self.redo, "redo"), ("Link", self.link_tasks, "link"),
+                        ("Unlink", self.unlink_tasks, "unlink"), ("Indent", self.indent_task, "indent"),
+                        ("Outdent", self.outdent_task, "outdent"))
+        for toolbar, entries in ((self.file_toolbar, file_actions), (self.task_toolbar, task_actions)):
+            for title, handler, icon in entries:
+                action = QAction(toolbar_icon(icon), title, self)
+                action.triggered.connect(handler)
+                action.setToolTip(title)
+                if title == "Undo":
+                    self.undo_action = action
+                    action.setShortcuts(QKeySequence.StandardKey.Undo)
+                    self.addAction(action)
+                elif title == "Redo":
+                    self.redo_action = action
+                    action.setShortcuts(QKeySequence.StandardKey.Redo)
+                    self.addAction(action)
+                elif title in ("Import", "Export"):
+                    action.setToolTip(f"{title} an MPP file")
+                toolbar.addAction(action)
+                toolbar.widgetForAction(action).setAccessibleName(title)
+        self.apply_toolbar_labels()
+        self.control_tabs = QTabWidget()
+        self.control_tabs.setDocumentMode(True)
+        self.control_tabs.addTab(self.file_toolbar, "File")
+        self.control_tabs.addTab(self.task_toolbar, "Project")
+        # Project actions are the normal working view; File remains the first tab.
+        self.control_tabs.setCurrentIndex(1)
+        zoom_style = """
+            QToolButton { color: #17334a; background: #edf3f7; border: 1px solid #a3b3bf;
+                          border-radius: 4px; padding: 2px 6px; font-size: 16px; font-weight: bold; }
+            QToolButton:hover { background: #cfe2f1; }
+            QToolButton:disabled { color: #51616f; background: #dce4e9; }
+        """
+        self.zoom_out_button = QToolButton()
+        self.zoom_out_button.setText("−")
+        self.zoom_out_button.setStyleSheet(zoom_style)
+        self.zoom_out_button.setToolTip("Zoom out: show more dates")
+        self.zoom_out_button.setAccessibleName("Zoom out")
+        self.zoom_out_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.zoom_out_button.clicked.connect(self.zoom_out)
+        self.zoom_indicator = QLabel("100%")
+        self.zoom_indicator.setStyleSheet("color: #17334a; background: #edf3f7; border-radius: 3px; padding: 3px 5px;")
+        self.zoom_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_in_button = QToolButton()
+        self.zoom_in_button.setText("+")
+        self.zoom_in_button.setStyleSheet(zoom_style)
+        self.zoom_in_button.setToolTip("Zoom in: show fewer dates")
+        self.zoom_in_button.setAccessibleName("Zoom in")
+        self.zoom_in_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.zoom_in_button.clicked.connect(self.zoom_in)
+        self.density_label = QLabel("Layout")
+        self.density_label.setStyleSheet("color: #f3f7fb; padding: 0 3px;")
+        self.density_selector = QComboBox()
+        self.density_selector.setAccessibleName("Layout density")
+        self.density_selector.setToolTip("Choose the compactness of task and resource rows")
+        for name in DENSITY_HEIGHTS:
+            self.density_selector.addItem(name.capitalize(), name)
+        self.density_selector.setCurrentIndex(self.density_selector.findData(self.density))
+        self.density_selector.setStyleSheet("""
+            QComboBox { color: #17334a; background: #edf3f7; border: 1px solid #a3b3bf;
+                        border-radius: 4px; padding: 2px 6px; }
+            QComboBox QAbstractItemView { color: #17334a; background: #edf3f7;
+                                         selection-color: #17334a; selection-background-color: #cfe2f1; }
+        """)
+        self.statusBar().addPermanentWidget(self.density_label)
+        self.statusBar().addPermanentWidget(self.density_selector)
+        self.statusBar().addPermanentWidget(self.zoom_out_button)
+        self.statusBar().addPermanentWidget(self.zoom_indicator)
+        self.statusBar().addPermanentWidget(self.zoom_in_button)
+        splitter = QSplitter()
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.control_tabs)
+        layout.addWidget(splitter, 1)
+        self.setCentralWidget(central)
+        self.tree = TaskTree(self)
+        self.tree.setColumnCount(9)
+        self.tree.setHeaderLabels(["ID", "Task", "Duration", "Start", "Finish", "Predecessors", "Resource", "Work", "Mode"])
+        self.tree.setTreePosition(1)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setIndentation(20)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed)
+        delegate = TaskDelegate(self)
+        delegate.closeEditor.connect(self.tree.editor_closed)
+        self.tree.setItemDelegate(delegate)
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header_metrics = self.tree.header().fontMetrics()
+        bold_font = QFont(self.tree.font())
+        bold_font.setBold(True)
+        data_metrics = QFontMetrics(bold_font)
+        duration_width = header_metrics.horizontalAdvance("Duration") + 14
+        date_width = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
+        work_width = max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
+        for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90)):
+            self.tree.setColumnWidth(i, width)
+        splitter.addWidget(self.tree)
+        self.chart_area = CalendarScrollArea(self)
+        self.chart_area.setWidgetResizable(False)
+        self.chart_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gantt = Gantt(self)
+        self.gantt.DAY = self.ZOOM_STEPS[self.zoom_index]
+        self.chart_area.setWidget(self.gantt)
+        splitter.addWidget(self.chart_area)
+        splitter.setSizes([820, 630])
+        self.tree.verticalScrollBar().valueChanged.connect(self.gantt.update)
+        self.tree.itemExpanded.connect(lambda *_: self.gantt.update())
+        self.tree.itemCollapsed.connect(lambda *_: self.gantt.update())
+        self.setStyleSheet("""
+            QMainWindow { background: #f5f7fa; }
+            QTabWidget::pane { border: 0; background: #f5f7fa; }
+            QTabBar::tab { color: #425a70; background: #e4ebf1; padding: 6px 18px; }
+            QTabBar::tab:selected { color: #17344c; background: #f5f7fa; font-weight: bold; }
+            QToolBar { spacing: 5px; padding: 7px; background: #f5f7fa; border: 0; }
+            QToolButton { padding: 6px 9px; border-radius: 4px; color: #24354a; }
+            QToolButton:hover { background: #dfeaf6; }
+            QStatusBar { background: #253444; color: #f3f7fb; }
+            QStatusBar::item { border: 0; }
+            QTreeWidget { border: 0; background: white; color: #24354a; alternate-background-color: #f9fafc; }
+            QTreeWidget::item { height: 29px; color: #24354a; }
+            QTreeWidget::item:selected { background: #d5e9fa; color: #183753; }
+            QHeaderView::section { background: #f4f6f9; padding: 6px; border: 0; border-right: 1px solid #e3e7ed; color: #54657b; }
+        """)
+        self.zoom_indicator.setFixedWidth(self.zoom_indicator.sizeHint().width())
+        self.apply_density()
+        self.density_selector.currentIndexChanged.connect(self.change_density)
+        self.update_zoom_controls()
+        self.refresh()
+        if preferences is None and self.preferences.status() != QSettings.Status.NoError:
+            QTimer.singleShot(0, self.sync_preferences)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "gantt"):
+            self.gantt.sync()
+
+    def apply_density(self):
+        height = DENSITY_HEIGHTS[self.density]
+        icon_dir = Path(__file__).resolve().parent / "assets" / "ui"
+        closed_icon = (icon_dir / "tree_closed.svg").as_posix().replace('"', '\\"')
+        open_icon = (icon_dir / "tree_open.svg").as_posix().replace('"', '\\"')
+        self.tree.setStyleSheet(f"""
+            QTreeWidget {{ border: 0; background: white; color: #24354a; alternate-background-color: #f9fafc; }}
+            QTreeWidget::item {{ height: {height}px; color: #24354a; }}
+            QTreeWidget::item:selected {{ background: #d5e9fa; color: #183753; }}
+            QTreeWidget::branch:has-children:closed {{ image: url("{closed_icon}"); }}
+            QTreeWidget::branch:has-children:open {{ image: url("{open_icon}"); }}
+        """)
+        self.tree.doItemsLayout()
+        if hasattr(self, "gantt"):
+            self.gantt.sync()
+
+    def change_density(self, _index):
+        density = self.density_selector.currentData()
+        if density not in DENSITY_HEIGHTS or density == self.density:
+            return
+        self.density = density
+        self.preferences.setValue("display/density", density)
+        self.sync_preferences()
+        self.apply_density()
+
+    def apply_toolbar_labels(self):
+        self.file_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon if self.show_icon_labels
+                                             else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.task_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon if self.show_icon_labels
+                                             else Qt.ToolButtonStyle.ToolButtonIconOnly)
+
+    def sync_preferences(self):
+        self.preferences.sync()
+        if self.preferences.status() != QSettings.Status.NoError:
+            QMessageBox.warning(self, "Preferences not saved",
+                                f"Could not save application preferences to {self.preferences.fileName()}.")
+
+    def update_zoom_controls(self):
+        self.zoom_out_button.setEnabled(self.zoom_index > 0)
+        self.zoom_in_button.setEnabled(self.zoom_index < len(self.ZOOM_STEPS) - 1)
+        self.zoom_indicator.setText(f"{round(self.ZOOM_STEPS[self.zoom_index] / 26 * 100)}%")
+
+    def change_zoom(self, step):
+        index = max(0, min(len(self.ZOOM_STEPS) - 1, self.zoom_index + step))
+        if index == self.zoom_index:
+            return
+        bar = self.chart_area.horizontalScrollBar()
+        viewport_width = self.chart_area.viewport().width()
+        center_day = (bar.value() + viewport_width / 2) / self.gantt.DAY
+        self.zoom_index = index
+        self.gantt.DAY = self.ZOOM_STEPS[index]
+        self.gantt.sync()
+        bar.setValue(round(center_day * self.gantt.DAY - viewport_width / 2))
+        self.preferences.setValue("display/zoom_width", self.gantt.DAY)
+        self.sync_preferences()
+        self.update_zoom_controls()
+
+    def zoom_out(self):
+        self.change_zoom(-1)
+
+    def zoom_in(self):
+        self.change_zoom(1)
+
+    def selected_uid(self):
+        item = self.tree.currentItem()
+        return item.data(0, Qt.ItemDataRole.UserRole) if item else None
+
+    def selected_uids(self):
+        selected = {item.data(0, Qt.ItemDataRole.UserRole) for item in self.tree.selectedItems()}
+        return [task.uid for task in self.plan.tasks if task.uid in selected]
+
+    def refresh(self, selected=None):
+        expanded = {uid for uid, item in self.items.items() if item.isExpanded()}
+        had_items = bool(self.items)
+        previous = self.tree.verticalScrollBar().value()
+        if selected is None:
+            selection = self.selected_uids()
+        else:
+            selection = [selected] if isinstance(selected, int) else list(selected)
+        self.calculated = schedule(self.plan)
+        self.resource_warnings = overallocation_warnings(self.plan)
+        estimates = estimated_tasks(self.plan)
+        self.tree.insertion = self.tree.insertion_before = None
+        self.tree.clear()
+        self.items = {}
+        for task in self.plan.tasks:
+            item = self.calculated[task.uid]
+            show_time = 0 < item.duration < 1
+            start = display_time(item.start, self.date_format, include_time=show_time)
+            finish = display_time(item.finish, self.date_format, include_time=show_time)
+            values = [str(task.uid), task.name, f"{item.duration:g} d{'?' if estimates[task.uid] else ''}",
+                      start, finish,
+                      ", ".join(map(str, task.predecessors)), format_task_resources(self.plan, task),
+                      f"{item.work:g} h", "Work" if task.mode == "work" else "Duration"]
+            node = QTreeWidgetItem(values)
+            node.setData(0, Qt.ItemDataRole.UserRole, task.uid)
+            node.setFlags(node.flags() | Qt.ItemFlag.ItemIsEditable)
+            node.setToolTip(2, "A question mark indicates an estimated duration.")
+            node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
+            node.setToolTip(4, display_time(item.finish, self.date_format))
+            node.setToolTip(5, "Predecessors: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas.")
+            if item.summary and (task.assignments or task.resource.strip()):
+                node.setToolTip(6, "Summary resources are retained but not included in scheduling or MPP export.")
+            elif any(assignment.resource_uid in self.resource_warnings for assignment in task.assignments):
+                node.setForeground(6, QColor("#a72a25"))
+                node.setToolTip(6, "One or more resources are overallocated. Open the Resource sheet for details.")
+            if item.summary:
+                font = QFont()
+                font.setBold(True)
+                for col in range(9):
+                    node.setFont(col, font)
+            if task.parent:
+                self.items[task.parent].addChild(node)
+            else:
+                self.tree.addTopLevelItem(node)
+            self.items[task.uid] = node
+        # The hint is longer than the Task column, so let its otherwise-empty
+        # row span the grid instead of truncating the keyboard shortcut.
+        space_width = max(1, self.tree.fontMetrics().horizontalAdvance(" "))
+        indent = " " * ((self.tree.columnWidth(0) + self.tree.indentation()) // space_width)
+        self.tree.placeholder = QTreeWidgetItem([indent + EMPTY_ROW_HINT, ""])
+        self.tree.placeholder.setFlags(self.tree.placeholder.flags() | Qt.ItemFlag.ItemIsEditable)
+        self.tree.placeholder.setForeground(0, QColor("#748399"))
+        self.tree.placeholder.setToolTip(0, "Shift+Enter inserts a task above the selected task.")
+        self.tree.addTopLevelItem(self.tree.placeholder)
+        self.tree.placeholder.setFirstColumnSpanned(True)
+        # Expand by default; retain a user's collapsed rows on subsequent refreshes.
+        for uid, node in self.items.items():
+            node.setExpanded(uid in expanded or not had_items)
+        for uid in selection:
+            if uid not in self.items:
+                continue
+            node = self.items[uid]
+            parent = node.parent()
+            while parent:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            node.setSelected(True)
+        if selection and selection[-1] in self.items:
+            index = self.tree.indexFromItem(self.items[selection[-1]])
+            self.tree.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.tree.verticalScrollBar().setValue(previous)
+        self.gantt.sync()
+        self.setWindowTitle(f"{self.plan.title}{' *' if self.dirty else ''} — OnePyProject")
+        overload = f"  •  {len(self.resource_warnings)} overallocated resource(s)" if self.resource_warnings else ""
+        self.statusBar().showMessage(f"{len(self.plan.tasks)} tasks  •  Standard calendar, 8h/day{overload}  •  MPP support is experimental")
+        self.undo_action.setEnabled(bool(self._undo))
+        self.redo_action.setEnabled(bool(self._redo))
+
+    def mutate(self, callback, selected=None):
+        old = copy.deepcopy(self.plan)
+        old_selection = self.selected_uids()
+        try:
+            callback()
+            schedule(self.plan)
+            if self.plan == old:
+                return True
+            self._undo.append((old, old_selection))
+            self._undo = self._undo[-100:]
+            self._redo.clear()
+            self.dirty = self._saved_plan is None or self.plan != self._saved_plan
+            self.refresh(selected)
+            return True
+        except (ValueError, KeyError, StopIteration, OverflowError) as exc:
+            self.plan = old
+            QMessageBox.warning(self, "Cannot update project", str(exc))
+            return False
+
+    def reset_history(self, saved):
+        self._undo.clear()
+        self._redo.clear()
+        self._saved_plan = copy.deepcopy(self.plan) if saved else None
+        self.dirty = not saved
+
+    def undo(self):
+        if not self._undo:
+            return
+        self._redo.append((copy.deepcopy(self.plan), self.selected_uids()))
+        self.plan, selected = self._undo.pop()
+        self.dirty = self._saved_plan is None or self.plan != self._saved_plan
+        self.refresh(selected)
+
+    def redo(self):
+        if not self._redo:
+            return
+        self._undo.append((copy.deepcopy(self.plan), self.selected_uids()))
+        self.plan, selected = self._redo.pop()
+        self.dirty = self._saved_plan is None or self.plan != self._saved_plan
+        self.refresh(selected)
+
+    def can_edit_cell(self, task, column):
+        if column == 1:
+            return True
+        if self.calculated[task.uid].summary:
+            return False
+        if column == 2:
+            return task.mode == "duration"
+        if column == 7:
+            return task.mode == "work"
+        return column in (3, 5, 6, 8)
+
+    def edit_cell(self, uid, column, value):
+        task = next((t for t in self.plan.tasks if t.uid == uid), None)
+        if task is None or not self.can_edit_cell(task, column):
+            return
+        def update():
+            text = value.strip()
+            if column == 1:
+                task.name = text
+            elif column == 2:
+                task.estimated = text.endswith("?")
+                if task.estimated:
+                    text = text[:-1].strip()
+                text = text.lower().removesuffix("days").removesuffix("day").removesuffix("d").strip()
+                task.duration = float(text)
+                if task.duration > 100000:
+                    raise ValueError("Duration cannot exceed 100,000 days")
+            elif column == 3:
+                # Don't add an unintended date constraint if the displayed start was unchanged.
+                if not task.earliest and text == self.calculated[uid].start.date().isoformat():
+                    return
+                task.earliest = date.fromisoformat(text).isoformat() if text else ""
+            elif column == 5:
+                task.predecessors = parse_predecessors(text)
+            elif column == 6:
+                set_task_resources(self.plan, task, text)
+            elif column == 7:
+                task.work = float(text.removesuffix("hours").removesuffix("hour").removesuffix("h").strip())
+                if task.work > 800000:
+                    raise ValueError("Work cannot exceed 800,000 hours")
+            elif column == 8:
+                if text == "work" and task.mode != "work":
+                    if not (task.resource.strip() or task.assignments):
+                        raise ValueError("Assign a resource before switching to fixed work")
+                    task.work = self.calculated[uid].work
+                elif text == "duration" and task.mode != "duration":
+                    task.duration = self.calculated[uid].duration
+                task.mode = text
+        self.mutate(update, uid)
+
+    def link_tasks(self):
+        selected = self.selected_uids()
+        if len(selected) < 2:
+            QMessageBox.information(self, "Link tasks", "Select at least two tasks. They will be linked in their row order.")
+            return
+        def link():
+            by_uid = {task.uid: task for task in self.plan.tasks}
+            for pred, succ in zip(selected, selected[1:]):
+                if pred not in {parse_dependency(link).uid for link in by_uid[succ].predecessors}:
+                    by_uid[succ].predecessors.append(pred)
+        self.mutate(link, selected)
+
+    def unlink_tasks(self):
+        selected = self.selected_uids()
+        if len(selected) < 2:
+            QMessageBox.information(self, "Unlink tasks", "Select at least two tasks to remove links between them.")
+            return
+        selected_set = set(selected)
+        def unlink():
+            for task in self.plan.tasks:
+                if task.uid in selected_set:
+                    task.predecessors = [link for link in task.predecessors
+                                         if parse_dependency(link).uid not in selected_set]
+        self.mutate(unlink, selected)
+
+    def confirm_discard(self):
+        if not self.dirty:
+            return True
+        return QMessageBox.question(self, "Unsaved changes", "Discard unsaved changes?",
+                                    QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel) == QMessageBox.StandardButton.Discard
+
+    def closeEvent(self, event):
+        if self.confirm_discard():
+            event.accept()
+        else:
+            event.ignore()
+
+    def new_plan(self):
+        if self.confirm_discard():
+            self.plan, self.plan_path, self.import_path, self.dirty = Plan(), None, None, False
+            self.reset_history(saved=True)
+            self.refresh()
+
+    def open_plan(self):
+        if not self.confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open project", "",
+            "Project files (*.pxplan *.PXPLAN *.mpp *.MPP);;"
+            "Microsoft Project (*.mpp *.MPP);;OnePyProject plan (*.pxplan *.PXPLAN)")
+        if not path:
+            return
+        if Path(path).suffix.lower() == ".mpp":
+            self.open_mpp_file(path)
+            return
+        try:
+            plan = load_plan(path)
+            self.plan, self.plan_path, self.import_path, self.dirty = plan, Path(path), None, False
+            self.reset_history(saved=True)
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot open plan", str(exc))
+
+    def save(self):
+        if not self.plan_path:
+            self.save_as()
+            return
+        self.save_onepyproject(str(self.plan_path))
+
+    def save_as(self):
+        path, file_type = QFileDialog.getSaveFileName(
+            self, "Save As", str(self.plan_path or ""),
+            "OnePyProject plan (*.pxplan);;Microsoft Project (*.mpp)")
+        if not path:
+            return
+        if file_type == "Microsoft Project (*.mpp)" or path.lower().endswith(".mpp"):
+            self.export_mpp_copy(path)
+            return
+        self.save_onepyproject(path)
+
+    def save_onepyproject(self, path):
+        if not path.lower().endswith(".pxplan"):
+            path += ".pxplan"
+        try:
+            save_plan(self.plan, path)
+            self.plan_path, self.dirty = Path(path), False
+            self._saved_plan = copy.deepcopy(self.plan)
+            self.refresh(self.selected_uid())
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot save plan", str(exc))
+
+    def open_mpp(self):
+        if not self.confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open MPP14", "", "Microsoft Project (*.mpp *.MPP)")
+        if not path:
+            return
+        self.open_mpp_file(path)
+
+    def open_mpp_file(self, path):
+        if QMessageBox.warning(self, "Lossy MPP import", IMPORT_WARNING,
+                               QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            return
+        try:
+            plan, notes = import_mpp(path)
+            self.plan, self.plan_path, self.import_path, self.dirty = plan, None, Path(path), True
+            self.reset_history(saved=False)
+            self.refresh()
+            overload = f"; {len(self.resource_warnings)} overallocated resource(s)" if self.resource_warnings else ""
+            self.statusBar().showMessage(f"Opened {Path(path).name} as an imported copy{overload}; save a .pxplan to keep changes")
+            if notes:
+                QMessageBox.warning(self, "Import details", "\n".join(notes[:30]) + ("\n..." if len(notes) > 30 else ""))
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot import MPP", str(exc))
+
+    def save_mpp(self):
+        self.export_mpp_copy()
+
+    def export_mpp_copy(self, path=None):
+        warning = (EXPORT_WARNING + "\n\nAn MPP is an interchange copy, not the editable "
+                   "OnePyProject working file. Save a .pxplan too to retain your work.")
+        if QMessageBox.warning(self, "Experimental MPP export", warning,
+                               QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            return
+        template, _ = QFileDialog.getOpenFileName(self, "Select MPP template", str(self.template), "Microsoft Project (*.mpp)")
+        if not template:
+            return
+        self.template = Path(template)
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(self, "Export to a NEW MPP file", "", "Microsoft Project (*.mpp)")
+        if not path:
+            return
+        if not path.lower().endswith(".mpp"):
+            path += ".mpp"
+        try:
+            notes = export_mpp(self.plan, template, path, (self.import_path,) if self.import_path else ())
+            QMessageBox.information(self, "MPP exported", "Saved a new MPP copy. Verify it in Microsoft Project. "
+                                    "Save a .pxplan to keep your editable working file." +
+                                    ("\n\nWriter warnings:\n" + "\n".join(notes) if notes else ""))
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot export MPP", str(exc))
+
+    def settings(self):
+        dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,
+                                self.show_icon_labels, self.preferences.fileName())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            def update():
+                self.plan.title = dialog.title.text().strip() or "Untitled project"
+                self.plan.start = dialog.start.text().strip()
+                self.plan.holidays = [d.strip() for d in dialog.holidays.text().split(",") if d.strip()]
+            if self.mutate(update, self.selected_uid()):
+                self.digit_edits_duration = dialog.digit_edits_duration.isChecked()
+                self.show_icon_labels = dialog.show_icon_labels.isChecked()
+                previous_date_format = self.date_format
+                self.date_format = dialog.date_format.currentData()
+                self.preferences.setValue("keyboard/digit_edits_duration", self.digit_edits_duration)
+                self.preferences.setValue("display/show_icon_labels", self.show_icon_labels)
+                self.preferences.setValue("display/date_format", self.date_format)
+                self.sync_preferences()
+                self.apply_toolbar_labels()
+                if self.date_format != previous_date_format:
+                    self.refresh()
+
+    def manage_resources(self):
+        dialog = ResourceSheetDialog(self.plan, self, density=self.density)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            def update():
+                migrate_legacy_resources(self.plan)
+                self.plan.resources = copy.deepcopy(dialog.result_resources)
+            self.mutate(update, self.selected_uid())
+
+    def assign_resources(self):
+        uid = self.selected_uid()
+        if uid is None:
+            QMessageBox.information(self, "Assign resources", "Select a task first.")
+            return
+        draft = copy.deepcopy(self.plan)
+        migrate_legacy_resources(draft)
+        task = next(task for task in draft.tasks if task.uid == uid)
+        dialog = AssignResourcesDialog(draft, task, self, density=self.density)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            assignments = dialog.selected_assignments()
+            def update():
+                migrate_legacy_resources(self.plan)
+                next(task for task in self.plan.tasks if task.uid == uid).assignments = assignments
+            self.mutate(update, uid)
+
+    def add_task(self):
+        uid = max((t.uid for t in self.plan.tasks), default=0) + 1
+        task = Task(uid=uid)
+        dialog = TaskDialog(task, self.plan, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            def add():
+                dialog.apply(task, self.plan)
+                self.plan.tasks.append(task)
+            self.mutate(add, uid)
+
+    def add_inline_task(self, name, before_uid=None):
+        name = name.strip()
+        if not name:
+            return
+        uid = max((t.uid for t in self.plan.tasks), default=0) + 1
+        def insert():
+            if before_uid is None:
+                self.plan.tasks.append(Task(uid=uid, name=name))
+                return
+            index = next((i for i, task in enumerate(self.plan.tasks) if task.uid == before_uid), None)
+            if index is None:
+                raise ValueError("The task to insert above no longer exists")
+            self.plan.tasks.insert(index, Task(uid=uid, name=name, parent=self.plan.tasks[index].parent))
+        self.mutate(insert, uid)
+
+    def edit_task(self):
+        uid = self.selected_uid()
+        if uid is None:
+            return
+        dialog = TaskDialog(next(t for t in self.plan.tasks if t.uid == uid), self.plan, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.mutate(lambda: dialog.apply(next(t for t in self.plan.tasks if t.uid == uid), self.plan), uid)
+
+    def delete_task(self):
+        uid = self.selected_uid()
+        if uid is None:
+            return
+        ids = descendants(self.plan, uid)
+        if QMessageBox.question(self, "Delete task", f"Delete {len(ids)} task(s) and their dependency links?") != QMessageBox.StandardButton.Yes:
+            return
+        def delete():
+            self.plan.tasks = [t for t in self.plan.tasks if t.uid not in ids]
+            for task in self.plan.tasks:
+                task.predecessors = [pred for pred in task.predecessors if parse_dependency(pred).uid not in ids]
+        self.mutate(delete)
+
+    def indent_task(self):
+        uid = self.selected_uid()
+        if uid is not None:
+            self.mutate(lambda: indent(self.plan, uid), uid)
+
+    def outdent_task(self):
+        uid = self.selected_uid()
+        if uid is not None:
+            self.mutate(lambda: outdent(self.plan, uid), uid)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("OnePyProject")
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.DS_Store
+.env
+.env.*
+# Local project plans and user-supplied Microsoft Project templates can contain
+# private data and are not required for the source repository.
+*.[pP][xX][pP][lL][aA][nN]
+*.[mM][pP][pP]
+*.[mM][pP][tT]

@@ -1,0 +1,204 @@
+from pathlib import Path
+from datetime import datetime
+
+import pytest
+
+from onepyproject.dependencies import parse_dependency
+from onepyproject.model import Plan, Resource, ResourceAssignment, Task, schedule
+from onepyproject.mpp import export_mpp, import_mpp
+
+
+TEMPLATE = Path(__file__).resolve().parents[1] / "template.mpp"
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_export_and_read_back(tmp_path):
+    plan = Plan(title="Round trip", start="2026-11-16", tasks=[
+        Task(1, "Phase"), Task(2, "Design", parent=1, duration=2),
+        Task(3, "Gate", parent=1, duration=0, predecessors=[2]),
+        Task(4, "Build", resource="Ada", duration=2, predecessors=[3]),
+    ])
+    output = tmp_path / "output.mpp"
+    before = TEMPLATE.read_bytes()
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [(t.uid, t.name, t.parent) for t in imported.tasks] == [
+        (1, "Phase", 0), (2, "Design", 1), (3, "Gate", 1), (4, "Build", 0)]
+    assert imported.tasks[2].predecessors == [2]
+    assert imported.resources[0].name == "Ada"
+    assert imported.tasks[3].assignments == [ResourceAssignment(imported.resources[0].uid, 100)]
+    assert schedule(imported)[3].duration == 0
+    assert not notes
+    assert TEMPLATE.read_bytes() == before
+    with pytest.raises(ValueError, match="overwrit"):
+        export_mpp(plan, TEMPLATE, TEMPLATE)
+    with pytest.raises(ValueError, match="overwrite"):
+        export_mpp(plan, TEMPLATE, output)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_import_existing_template():
+    plan, _ = import_mpp(TEMPLATE)
+    assert plan.tasks
+    schedule(plan)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_estimated_duration_mpp_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Summary"), Task(2, "Estimate", parent=1, duration=2, estimated=True),
+        Task(3, "Confirmed"),
+    ])
+    output = tmp_path / "estimated.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, _ = import_mpp(output)
+    assert [task.estimated for task in imported.tasks] == [True, True, False]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_multiple_resources_and_unassigned_resource_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada", 75), Resource(2, "Ben", 150), Resource(7, "Unassigned", 0)], tasks=[
+        Task(1, "Team task", duration=3,
+             assignments=[ResourceAssignment(1, 50), ResourceAssignment(2, 125)]),
+    ])
+    output = tmp_path / "team.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [(r.uid, r.name, r.max_units) for r in imported.resources] == [(1, "Ada", 75), (2, "Ben", 150), (7, "Unassigned", 0)]
+    assert imported.tasks[0].assignments == [ResourceAssignment(1, 50), ResourceAssignment(2, 125)]
+    assert not notes
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_export_without_resources_does_not_keep_template_resources(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Unassigned")])
+    output = tmp_path / "no-resources.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert imported.resources == []
+    assert imported.tasks[0].assignments == []
+    assert not notes
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_fixed_work_and_multiple_assignments_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada"), Resource(2, "Ben")], tasks=[
+        Task(1, "Effort", mode="work", work=80,
+             assignments=[ResourceAssignment(1, 100), ResourceAssignment(2, 100)]),
+    ])
+    output = tmp_path / "effort.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert imported.tasks[0].mode == "work"
+    assert imported.tasks[0].work == 80
+    assert len(imported.tasks[0].assignments) == 2
+    assert schedule(imported)[1].duration == 5
+    assert not notes
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_zero_allocation_from_mpp_is_not_silently_made_full_time(tmp_path, monkeypatch):
+    import onepyproject.mpp as mpp
+    plan = Plan(resources=[Resource(1, "Ada")], tasks=[
+        Task(1, "Task", assignments=[ResourceAssignment(1, 100)]),
+    ])
+    output = tmp_path / "source.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    read_values = mpp._mpp_resource_values
+    def zero_allocation(path):
+        capacities, allocations = read_values(path)
+        return capacities, [(task_uid, resource_uid, 0) for task_uid, resource_uid, _ in allocations]
+    monkeypatch.setattr(mpp, "_mpp_resource_values", zero_allocation)
+    imported, notes = import_mpp(output)
+    assert not imported.tasks[0].assignments
+    assert any("0% allocation" in note for note in notes)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_real_zero_allocation_in_mpp_is_reported(tmp_path):
+    from pymppwriter import Assignment, MppWriter, Project, Resource as MppResource, Task as MppTask
+    from onepyproject.mpp_template import strip_template_resources
+    output = tmp_path / "zero.mpp"
+    project = Project("Zero", datetime(2026, 11, 16, 8),
+                      tasks=[MppTask(1, "Task", datetime(2026, 11, 16, 8), datetime(2026, 11, 16, 17))],
+                      resources=[MppResource(1, "Ada")], assignments=[Assignment(1, 1, 0)])
+    writer = MppWriter(str(TEMPLATE))
+    strip_template_resources(writer)
+    writer.write(project, str(output))
+    imported, notes = import_mpp(output)
+    assert not imported.tasks[0].assignments
+    assert any("0% allocation" in note for note in notes)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_duplicate_mpp_resource_names_are_distinguished_and_reported(tmp_path):
+    from pymppwriter import Assignment, MppWriter, Project, Resource as MppResource, Task as MppTask
+    from onepyproject.mpp_template import strip_template_resources
+    output = tmp_path / "duplicate-names.mpp"
+    project = Project("Duplicate names", datetime(2026, 11, 16, 8),
+                      tasks=[MppTask(1, "Task", datetime(2026, 11, 16, 8), datetime(2026, 11, 16, 17))],
+                      resources=[MppResource(1, "Ada"), MppResource(2, "Ada")],
+                      assignments=[Assignment(1, 1, 0.5), Assignment(1, 2, 1)])
+    writer = MppWriter(str(TEMPLATE))
+    strip_template_resources(writer)
+    writer.write(project, str(output))
+    imported, notes = import_mpp(output)
+    assert [(resource.uid, resource.name) for resource in imported.resources] == [(1, "Ada"), (2, "Ada (ID 2)")]
+    assert imported.tasks[0].assignments == [ResourceAssignment(1, 50), ResourceAssignment(2, 100)]
+    assert any("renamed duplicate" in note for note in notes)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_summary_resource_assignment_is_not_silently_dropped_on_export(tmp_path):
+    plan = Plan(resources=[Resource(1, "Ada")], tasks=[
+        Task(1, "Summary", assignments=[ResourceAssignment(1)]), Task(2, "Child", parent=1),
+    ])
+    output = tmp_path / "summary.mpp"
+    with pytest.raises(ValueError, match="summary resource assignments"):
+        export_mpp(plan, TEMPLATE, output)
+    assert not output.exists()
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_dependency_types_and_working_lag_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "A", duration=4),
+        Task(2, "FS", predecessors=["1FS-1d"]),
+        Task(3, "SS", predecessors=["1SS+2h"]),
+        Task(4, "FF", predecessors=["1FF-0.5d"]),
+        Task(5, "SF", predecessors=["1SF+1w"]),
+        Task(6, "Fraction", predecessors=["1FS+0.1m"]),
+    ])
+    output = tmp_path / "dependencies.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    links = [parse_dependency(task.predecessors[0]) for task in imported.tasks[1:]]
+    assert [(link.kind, link.lag) for link in links] == [
+        ("FS", -1), ("SS", 0.25), ("FF", -0.5), ("SF", 5), ("FS", pytest.approx(1 / 4800)),
+    ]
+    assert not notes
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+@pytest.mark.parametrize("link", ["1FS+2ed", "1FS+50%"])
+def test_mpp_export_rejects_unrepresentable_lag(tmp_path, link):
+    plan = Plan(tasks=[Task(1, "A"), Task(2, "B", predecessors=[link])])
+    output = tmp_path / "unsafe.mpp"
+    with pytest.raises(ValueError, match="cannot preserve elapsed or percentage"):
+        export_mpp(plan, TEMPLATE, output)
+    assert not output.exists()
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_import_does_not_guess_unknown_lag_units(tmp_path, monkeypatch):
+    import onepyproject.mpp as mpp
+    plan = Plan(tasks=[Task(1, "A"), Task(2, "B", predecessors=["1SS+1d"])])
+    output = tmp_path / "source.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    real_records = mpp._mpp_relation_records
+    def unknown_units(path):
+        return [(pred, succ, kind, 8, lag) for pred, succ, kind, _, lag in real_records(path)]
+    monkeypatch.setattr(mpp, "_mpp_relation_records", unknown_units)
+    imported, notes = import_mpp(output)
+    assert not imported.tasks[1].predecessors
+    assert any("unsupported MPP" in note for note in notes)

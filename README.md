@@ -1,0 +1,52 @@
+# OnePyProject
+
+An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The editable OnePyProject plan (`.pxplan`) is separate from MPP interchange.
+
+Existing ProjectX `.pxplan` files remain compatible; their historical internal format identifier is intentionally retained. Personal plans and MPP templates are excluded from the repository.
+
+## Run from source
+
+Python 3.10 or newer is required. In the project directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+python -m onepyproject.app
+```
+
+On Windows PowerShell, create the virtual environment with `py -m venv .venv`, then use `.venv\Scripts\Activate.ps1` and run the remaining Python commands. Installers are not yet provided.
+
+The **File** tab contains New, Open, Save, Save As, Import, and Export; the **Project** tab contains task controls, Resources, Assign, and Settings. Toolbar controls show icons only by default; hover for their names or enable **Show toolbar icon names** in Settings. Click **+ Task** to add tasks. Double-click an editable cell (or select it and press F2) to edit it directly; **Edit** opens the full task dialog. Start edits specify an earliest start, so dependencies may move the task later. Summary values, finish dates, IDs, and calculated work or duration are read-only. Use **Indent / Outdent** to create summaries. Select multiple tasks using Shift or Command/Ctrl and choose **Link** to create finish-to-start links in row order, or **Unlink** to remove links between the selected tasks. Predecessors are task IDs, not row numbers. **Undo / Redo** support up to 100 changes and the usual keyboard shortcuts. **Settings** controls the project start and holidays. **Open** accepts `.pxplan` and MPP14 `.mpp` files; **Import** is an alternative way to open an MPP. MPP opening imports a potentially incomplete copy and recalculates it, leaving the original unchanged. **Save** saves the working `.pxplan`; **Save As** offers `.pxplan` or `.mpp`, and **Export** also creates an MPP copy. MPP export asks for a template and will not overwrite any existing MPP. Export does not replace saving the working plan.
+
+Use **Resources** to add or rename people and teams, set their maximum allocation, and see overallocation warnings. Select a task and choose **Assign** to assign several resources at individual percentages. Alternatively, enter names in the Resource cell, such as `Ada[50%], Ben`; existing resources are suggested as you type, and new names are added to the resource sheet. Select a suggestion with Enter, Tab, or a click; press Enter again to save the cell. Escape dismisses suggestions without choosing one. Resource names containing commas can be quoted, for example `"Ada, Senior[50%]", Ben`. If a name is ambiguous, use **Assign**. Removing a resource requires removing its assignments first. Overallocation warnings do not move tasks. Older `.pxplan` files are migrated when opened; newly saved plans use version 2 and may not open in earlier versions of the application.
+
+Double-click the empty row or empty area beneath tasks, or select it and press **Enter**, to add one. Press **Insert** or **Shift+Enter** on an existing task to add a task above it at the same outline level. With a task selected, **Tab** indents it, **Shift+Tab** outdents it, and **Delete/Backspace** deletes it after confirmation; text-editing keys keep their usual behavior while a cell editor is open. Typing a digit on an editable task starts entering its duration in days; this shortcut can be turned off in **Settings** and is remembered for the application. Type a question mark after a duration, such as `2d?`, to mark it estimated; remove the question mark to mark it confirmed. The task dialog also has an estimate checkbox. A summary shows `?` when marked estimated itself or when a descendant is estimated. Milestones and durations of at least one day display dates without times; hover over Start or Finish to see the exact time. Use **− / +** in the bottom bar to change the Gantt timescale up to 100% without changing the schedule. Choose **Comfortable**, **Tight** (default), or **Dense** in the bottom bar to adjust task and resource row spacing; an existing saved choice is preserved.
+
+Choose **System**, **11Nov HH:MM**, or **YYYY-MM-DD HH:MM** in Settings to change the date display. System uses the operating system's locale. The chosen display format is remembered for the application; date entry remains `YYYY-MM-DD`. Duration, Start, Finish and Work start at content-sized widths and can be resized.
+
+Application preferences, including toolbar names, row density, date format, keyboard behavior and zoom, are stored per user with Qt's native settings. The exact location is shown in **Settings**. On macOS it is typically `~/Library/Preferences/com.onepyproject.OnePyProject.plist`; on Windows it is typically `HKEY_CURRENT_USER\Software\OnePyProject\OnePyProject` in the registry. Existing ProjectX preferences are copied once without overwriting new settings or deleting the originals. Project-specific details remain in the `.pxplan` file. The app warns if preferences cannot be saved.
+
+## Scope and limitations
+
+- The scheduler supports FS, SS, FF and SF links, working-time and elapsed lead/lag, multiple resources per task, fixed-duration or fixed-work tasks, zero-duration milestones and summary rollups. Enter links in the Predecessors cell, for example `5`, `5SS+3d`, `5FF-1d`, `5SF+2d`, `5FS+50%`, or `5FS+2ed`; separate multiple links with commas. FS is the default, and a lag without a unit is treated as working days (`5SF+2` becomes `5SF+2d`). Percentage lag is based on predecessor working duration. Working units are `m`, `h`, `d`, `w`, `mo` (1 day = 8 hours, 1 week = 5 days, 1 month = 20 days); elapsed units are `em`, `eh`, `ed`, `ew`, `emo` (24-hour days, 7-day weeks, 30-day months). Elapsed calculations use local wall-clock time without daylight-saving adjustments. Summary-task dependencies are not supported.
+- The calendar is Monday–Friday, 08:00–12:00 and 13:00–17:00, with optional whole-day holidays. No resource levelling or resource-specific calendars are performed. Imported schedules are recalculated and can change. The scheduler has not been verified against Microsoft Project for all dependency combinations, especially finish constraints at non-working boundaries.
+- Work is hours, and each allocation is a percentage. Fixed-work duration is work divided by the sum of assigned allocations; at least one resource is required. Fixed-duration tasks calculate work from duration and the sum of allocations. All resources share the project calendar. Individual calendars, costs, time-varying allocation and automatic levelling are not supported. Overallocation warnings only consider overlapping working time and do not change the schedule. Summary-task assignments may be retained on import but are not scheduled and must be removed before MPP export. This is a simplified model and does not claim full Microsoft Project scheduling equivalence.
+- pymppwriter is alpha software. MPP import and export are **lossy** and have not yet been verified in Microsoft Project. Resource names, maximum units and multiple positive-percentage assignments are imported and exported; fixed-units tasks are approximated as fixed-duration, and zero-percentage assignments are reported and omitted. All four dependency types and working lags can be written; working lags are exported as days. MPP export refuses nonzero elapsed or percentage lags because pymppwriter cannot preserve their units. Import omits nonzero lags whose units the reader cannot safely identify and reports them. The reader can also omit unscheduled tasks and does not fully read calendars or task types. Resource calendars, rates, costs, progress, timephased data, summary-task dependencies, constraints, baselines, custom data and other Project features are not preserved in the OnePyProject model. Import reports some known omissions, not necessarily all losses. Keep the source MPP unchanged and verify exported files in Microsoft Project before relying on them.
+- MPP export requires a user-supplied `template.mpp`, which is not included in the repository. OnePyProject removes its resource records before generating a new MPP, but pymppwriter retains other template streams, so exports may still include hidden project data, names, metadata, or other private information. Use a suitably licensed, minimal template and audit exports before distribution. Do not assume that deleting visible tasks removes hidden data.
+- The Gantt view supports at most 5,000 days of timeline from its start. Time and dates are local wall-clock values, with no timezone conversions.
+- The free Qt/PySide6 distribution has LGPL/GPL obligations. Check all licences and how to comply before distributing a packaged application; signing and notarization can have separate costs.
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+The optional integration test uses `template.mpp` if present and writes only to a temporary directory. It checks pymppwriter read-back, **not** Microsoft Project compatibility. Test representative exports in a licensed copy of Microsoft Project, both before and after recalculation.
+
+## Packaging
+
+PyInstaller can bundle the application, but builds must be produced and tested separately on Windows and macOS. Include the bundled SVG icon assets and Qt's SVG icon plugin so icons scale correctly. Bundling, platform signing, LGPL compliance, and template redistribution rights have not yet been validated. Keep `template.mpp` external and select it at export time.
+
+Toolbar artwork uses [Icons8 Flat Color Icons](https://github.com/icons8/flat-color-icons), under the MIT licence option. The included attribution and licence are in `onepyproject/assets/flat_color_icons/LICENSE.txt`.
