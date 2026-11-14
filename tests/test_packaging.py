@@ -6,6 +6,8 @@ import sys
 
 import pytest
 
+from onepyproject import __version__
+
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("package_artifact", ROOT / "packaging" / "package_artifact.py")
@@ -43,6 +45,16 @@ def test_package_requires_svg_image_plugin(tmp_path):
         packaging.check_tree(bundle)
 
 
+def test_package_rejects_a_different_frozen_version(monkeypatch):
+    def run_other_version(args, **kwargs):
+        Path(args[-1]).write_text("Packaging smoke test passed: 0.0.0.\n", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(packaging.subprocess, "run", run_other_version)
+    with pytest.raises(RuntimeError, match="Frozen smoke test failed"):
+        packaging.smoke_test(Path("app"))
+
+
 def test_source_packaging_smoke(tmp_path):
     report = tmp_path / "report.txt"
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONPATH=str(ROOT))
@@ -51,4 +63,4 @@ def test_source_packaging_smoke(tmp_path):
         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, report.read_text(encoding="utf-8") if report.exists() else result.stderr
-    assert report.read_text(encoding="utf-8").strip() == "Packaging smoke test passed."
+    assert report.read_text(encoding="utf-8").strip() == f"Packaging smoke test passed: {__version__}."

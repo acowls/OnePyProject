@@ -21,4 +21,4 @@ This is an incomplete inventory, **not a distribution compliance statement**.
 Before sharing the binary, audit every bundled library and plugin, provide all
 required licences and corresponding source or a valid offer, and verify that
 recipients can replace the LGPL libraries. Signing may affect replacement.
-OnePyProject's own licence has not yet been chosen.
+OnePyProject itself is licensed under MIT; see `LICENSE`.

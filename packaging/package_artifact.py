@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = runpy.run_path(str(ROOT / "onepyproject" / "__init__.py"))["__version__"]
 TARGETS = ("macos-arm64", "macos-x64", "windows-x64")
 PRIVATE_EXTENSIONS = {".mpp", ".mpt", ".pxplan"}
 
@@ -59,7 +61,7 @@ def smoke_test(executable):
             cwd=temporary, env=environment, capture_output=True, timeout=120,
         )
         details = report.read_text(encoding="utf-8") if report.exists() else "No report produced."
-        if result.returncode or details.strip() != "Packaging smoke test passed.":
+        if result.returncode or details.strip() != f"Packaging smoke test passed: {VERSION}.":
             raise RuntimeError(
                 f"Frozen smoke test failed ({result.returncode}): {details}\n"
                 f"stdout: {result.stdout.decode(errors='replace')}\n"
@@ -76,7 +78,7 @@ def make_artifact(target, dist, output):
     if platform.system() != expected_system or actual_machine != expected_machine:
         raise RuntimeError(f"Target {target} does not match {platform.system()} {machine}")
 
-    name = f"OnePyProject-{target}"
+    name = f"OnePyProject-{VERSION}-{target}"
     output.mkdir(parents=True, exist_ok=True)
     archive = (output / f"{name}.zip").resolve()
     app_name = "OnePyProject.app" if expected_system == "Darwin" else "OnePyProject"
@@ -86,6 +88,7 @@ def make_artifact(target, dist, output):
         stage.mkdir()
         shutil.copytree(dist / app_name, stage / app_name, symlinks=True)
         shutil.copyfile(ROOT / "packaging" / "THIRD_PARTY_NOTICES.md", stage / "THIRD_PARTY_NOTICES.md")
+        shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
         licences = stage / "licenses"
         licences.mkdir()
         for dependency in ("pymppwriter", "olefile", "PyInstaller"):
@@ -93,6 +96,7 @@ def make_artifact(target, dist, output):
         shutil.copyfile(ROOT / "onepyproject" / "assets" / "flat_color_icons" / "LICENSE.txt", licences / "icons8.txt")
         manifest = {
             "target": target,
+            "version": VERSION,
             "python": sys.version,
             "dependencies": {name: metadata.version(name) for name in
                              ("PySide6-Essentials", "shiboken6", "pymppwriter", "olefile", "PyInstaller")},

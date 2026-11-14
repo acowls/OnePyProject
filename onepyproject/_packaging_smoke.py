@@ -9,6 +9,7 @@ from PySide6.QtGui import QIcon, QImage
 from PySide6.QtWidgets import QApplication
 
 import pymppwriter
+from . import __version__
 from .app import MainWindow
 from .icons import ASSET_DIR, ICON_FILES
 from .model import Plan, Task, load_plan, save_plan
@@ -61,4 +62,6 @@ def run():
         app.processEvents()
         if window.grab().isNull() or len(window.items) != 2:
             raise RuntimeError("Main window did not render the test plan")
+        if __version__ not in window.windowTitle():
+            raise RuntimeError("Application version is missing from the window title")
         window.close()

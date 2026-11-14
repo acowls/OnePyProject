@@ -8,6 +8,7 @@ root = Path(SPECPATH).parent
 datas = [
     (str(root / "onepyproject" / "assets"), "onepyproject/assets"),
     (str(root / "packaging" / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(root / "LICENSE"), "."),
 ]
 datas += collect_data_files("pymppwriter")
 datas += copy_metadata("pymppwriter") + copy_metadata("olefile")

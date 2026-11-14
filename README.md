@@ -1,6 +1,6 @@
 # OnePyProject
 
-An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The editable OnePyProject plan (`.pxplan`) is separate from `MPP` interchange that can also be read and written.
+An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The current version is **0.1.0a1** (the first 0.1.0 alpha). The editable OnePyProject plan (`.pxplan`) is separate from `MPP` interchange that can also be read and written.
 
 ## Run from source
 
@@ -45,7 +45,13 @@ The optional integration test uses `template.mpp` if present and writes only to 
 
 ## Packaging
 
-The manual **Private desktop builds** GitHub Actions workflow builds macOS Apple Silicon, macOS Intel and Windows x64 separately. Once the workflow is committed and pushed, run it from the repository's Actions tab and download the matching artifact. Private-repository runner and artifact usage may incur charges. The macOS builds require macOS 14 or newer. The Windows build runs its automated checks on a Windows Server runner; it still needs testing on Windows 11.
+The manual **Private desktop builds** GitHub Actions workflow builds macOS Apple Silicon, macOS Intel and Windows x64 separately. To build the current alpha:
+
+1. Commit and push the changes containing the desired version to the branch you want to build.
+2. In the repository on GitHub, open **Actions → Private desktop builds → Run workflow**, select that branch and click **Run workflow**.
+3. Open the completed run and download the matching artifact. Artifact names and `BUILD_INFO.json` include the version; artifacts expire after seven days.
+
+The version is defined in `onepyproject/__init__.py` using Python's pre-release format (`0.1.0a1`, `0.1.0a2`, and so on). This workflow builds whatever version is on the selected branch; it does not create a GitHub release. Private-repository runner and artifact usage may incur charges. The macOS builds require macOS 14 or newer. The Windows build runs its automated checks on a Windows Server runner; it still needs testing on Windows 11.
 
 Each artifact contains a ZIP: extract it fully, then open `OnePyProject.app` on macOS or `OnePyProject/OnePyProject.exe` on Windows. The app is not signed with a developer identity or notarized, so operating-system security warnings are expected. These are **private test builds, not public releases**. No installer is provided.
 
@@ -53,10 +59,10 @@ To build locally in a clean Python 3.12 environment on the target OS and archite
 
 The CI smoke test checks plan saving, the window and SVG icons, but cannot test MPP import/export without a template. To include that local check, set `ONEPYPROJECT_SMOKE_MPP_TEMPLATE` to your external template's absolute path before running `package_artifact.py`; the test writes a disposable MPP in a temporary directory and checks that the template remains unchanged.
 
-The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. Before distribution, choose the application's own licence and review all bundled third-party licences, required notices and corresponding source, library replacement, signing and notarization. See `packaging/THIRD_PARTY_NOTICES.md`; it is not a complete compliance inventory. Keep `template.mpp` external and select it at export time.
+The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. Before distribution, review all bundled third-party licences, required notices and corresponding source, library replacement, signing and notarization. See `packaging/THIRD_PARTY_NOTICES.md`; it is not a complete compliance inventory. Keep `template.mpp` external and select it at export time.
 
 ## License
 
-The free Qt/PySide6 distribution has LGPL/GPL obligations. Check all licences and how to comply before distributing a packaged application; signing and notarization can have separate costs.
+OnePyProject's own code is licensed under the [MIT licence](LICENSE). Its dependencies have separate licences: the free Qt/PySide6 distribution has LGPL/GPL obligations. Check all licences and how to comply before distributing a packaged application; signing and notarization can have separate costs.
 
 Toolbar artwork uses [Icons8 Flat Color Icons](https://github.com/icons8/flat-color-icons), under the MIT licence option. The included attribution and licence are in `onepyproject/assets/flat_color_icons/LICENSE.txt`.

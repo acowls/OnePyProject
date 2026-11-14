@@ -14,10 +14,10 @@ Status: prototype, reviewed 13 November 2026. This document records the agreed d
 - **Python 3.10+** for the application, scheduling model and interchange adapter.
 - **PySide6 / Qt** for a single cross-platform desktop interface, using a Qt tree grid and custom Gantt drawing. No server or Java runtime is needed by the shipped application.
 - **pymppwriter 0.4.3**, pinned, for experimental MPP14 reading and writing. It is alpha software and uses a user-supplied MPP template.
-- **pytest** for automated tests. **PyInstaller** is the planned packaging tool; builds must be produced and tested separately on Windows and macOS. Installers, signing and notarization are not yet validated.
+- **pytest** for automated tests. **PyInstaller** produces private test builds separately for Windows and macOS. Installers, signing and notarization are not yet validated.
 - **Icons8 Flat Color Icons**, using its MIT licence option. SVGs are bundled locally and passed to Qt as scalable icons for high-DPI rendering. Licence and attribution are in `onepyproject/assets/flat_color_icons/LICENSE.txt`.
 
-The selected libraries are free to use, subject to their licence obligations. In particular, PySide6/Qt's open-source licences must be reviewed before distributing a packaged app. Platform signing or notarization may have separate costs; no decision about the application's own distribution licence has been made.
+OnePyProject's own code is licensed under MIT. Its dependencies have separate licences: in particular, PySide6/Qt's open-source licences must be reviewed before distributing a packaged app. Platform signing or notarization may have separate costs.
 
 Alternatives considered: Aspose.Tasks can write MPP but was rejected because it requires a commercial licence. MPXJ is a free MPP reader but cannot write MPP. Microsoft Project XML is a useful interchange fallback, but it is not the binary MPP file the user requested. The Python/pymppwriter stack was selected with the understanding that its alpha status and template-based output require extra verification.
 

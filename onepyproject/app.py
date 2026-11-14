@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QPointF
 
+from . import __version__
 from .model import Plan, Task, descendants, estimated_tasks, indent, load_plan, outdent, save_plan, schedule
 from .dependencies import parse_dependency, parse_predecessors
 from .icons import toolbar_icon
@@ -521,7 +522,7 @@ class MainWindow(QMainWindow):
         self._redo: list[tuple[Plan, list[int]]] = []
         saved_zoom = self.preferences.value("display/zoom_width", 26, type=int)
         self.zoom_index = self.ZOOM_STEPS.index(saved_zoom) if saved_zoom in self.ZOOM_STEPS else self.ZOOM_STEPS.index(26)
-        self.setWindowTitle("OnePyProject")
+        self.setWindowTitle(f"OnePyProject {__version__}")
         self.resize(1450, 800)
 
         self.file_toolbar = QToolBar("File")
@@ -818,7 +819,7 @@ class MainWindow(QMainWindow):
             self.tree.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
         self.tree.verticalScrollBar().setValue(previous)
         self.gantt.sync()
-        self.setWindowTitle(f"{self.plan.title}{' *' if self.dirty else ''} — OnePyProject")
+        self.setWindowTitle(f"{self.plan.title}{' *' if self.dirty else ''} — OnePyProject {__version__}")
         overload = f"  •  {len(self.resource_warnings)} overallocated resource(s)" if self.resource_warnings else ""
         self.statusBar().showMessage(f"{len(self.plan.tasks)} tasks  •  Standard calendar, 8h/day{overload}  •  MPP support is experimental")
         self.undo_action.setEnabled(bool(self._undo))
@@ -1162,6 +1163,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("OnePyProject")
+    app.setApplicationVersion(__version__)
     window = MainWindow()
     window.show()
     return app.exec()

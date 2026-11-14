@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "onepyproject"
-version = "0.1.0"
+dynamic = ["version"]
 description = "An experimental offline project planner"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = ["PySide6-Essentials>=6.8,<6.13", "pymppwriter==0.4.3"]
 
@@ -17,6 +18,9 @@ onepyproject = "onepyproject.app:main"
 
 [tool.setuptools.packages.find]
 include = ["onepyproject*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "onepyproject.__version__"}
 
 [tool.setuptools.package-data]
 onepyproject = ["assets/flat_color_icons/*.svg", "assets/flat_color_icons/*.txt", "assets/ui/*.svg"]
