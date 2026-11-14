@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["PySide6-Essentials>=6.8,<6.13", "pymppwriter==0.4.3"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pyinstaller>=6"]
+dev = ["pytest>=8", "pyinstaller>=6", "pypdf>=5,<8"]
 
 [project.scripts]
 onepyproject = "onepyproject.app:main"

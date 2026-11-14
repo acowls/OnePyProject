@@ -53,6 +53,31 @@ def parse_predecessors(text: str) -> list[int | str]:
     return result
 
 
+def task_numbers(tasks) -> dict[int, int]:
+    """Map stable task identifiers to their current one-based display numbers."""
+    return {task.uid: number for number, task in enumerate(tasks, 1)}
+
+
+def remap_predecessors(values: list[int | str], mapping: dict[int, int]) -> list[int | str]:
+    """Replace only IDs, retaining link type, lag, precision, and stored text."""
+    result = []
+    for value in values:
+        link = parse_dependency(value)
+        if link.uid not in mapping:
+            raise ValueError(f"Task ID {link.uid} does not exist")
+        replacement = mapping[link.uid]
+        if isinstance(value, int):
+            result.append(replacement)
+        else:
+            result.append(re.sub(r"^(\s*)\d+", lambda match: f"{match.group(1)}{replacement}", value, count=1))
+    return result
+
+
+def parse_display_predecessors(text: str, tasks) -> list[int | str]:
+    numbers = task_numbers(tasks)
+    return remap_predecessors(parse_predecessors(text), {number: uid for uid, number in numbers.items()})
+
+
 def lag_minutes(link: Dependency, predecessor_duration_days: float) -> tuple[float, bool]:
     if link.unit == "%":
         minutes = predecessor_duration_days * 480 * link.lag / 100

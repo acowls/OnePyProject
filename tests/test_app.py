@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime
 from pathlib import Path
 import subprocess
 import sys
@@ -11,13 +12,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, QSize, QTime, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QLineEdit, QMessageBox,
+                               QStyle, QStyleOptionComboBox)
 
-from onepyproject.app import EMPTY_ROW_HINT, MainWindow, SettingsDialog
+from onepyproject.app import COLUMN_WIDTH_KEY, EMPTY_ROW_HINT, TASK_COLUMN_KEYS, ExportDialog, MainWindow, SettingsDialog, TaskDialog, display_time
 from onepyproject.icons import ASSET_DIR, ICON_FILES, toolbar_icon
 from onepyproject.model import Plan, Task, load_plan, save_plan, schedule
 from onepyproject.mpp import import_mpp
-from onepyproject.ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS
+from onepyproject.ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY
 
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "template.mpp"
@@ -189,7 +191,7 @@ def test_date_formats_hide_time_for_long_tasks(app, tmp_path, style):
         start_time = QLocale.system().toString(QTime(8, 0), QLocale.FormatType.ShortFormat)
         finish_time = QLocale.system().toString(QTime(12, 0), QLocale.FormatType.ShortFormat)
     elif style == "short":
-        day, start_time, finish_time = "11Nov", "08:00", "12:00"
+        day, start_time, finish_time = "11 Nov", "08:00", "12:00"
     else:
         day, start_time, finish_time = "2026-11-11", "08:00", "12:00"
     assert window.items[1].text(3) == day
@@ -200,6 +202,149 @@ def test_date_formats_hide_time_for_long_tasks(app, tmp_path, style):
     assert window.items[3].text(4) == day
     assert start_time in window.items[1].toolTip(3)
     assert window.tree.columnWidth(3) == window.tree.columnWidth(4)
+
+
+@pytest.mark.parametrize("month,expected", [(1, "01 Jan"), (2, "01 Feb"), (11, "01 Nov"), (12, "01 Dec")])
+def test_short_dates_include_space_and_keep_times(month, expected):
+    value = datetime(2026, month, 1, 8, 30, 6)
+    assert display_time(value, "short", include_time=False) == expected
+    assert display_time(value, "short") == f"{expected} 08:30:06"
+
+
+def test_settings_project_name_field_is_wide_and_resizable(app):
+    title = "A longer project name for implementation and international rollout"
+    dialog = SettingsDialog(Plan(title=title))
+    dialog.show()
+    app.processEvents()
+    original_width = dialog.title.width()
+    assert original_width >= 400 and dialog.title.text() == title
+    dialog.resize(dialog.width() + 200, dialog.height())
+    app.processEvents()
+    assert dialog.title.width() >= original_width + 150
+    dialog.close()
+
+
+@pytest.mark.parametrize("density", ["comfortable", "tight", "dense"])
+@pytest.mark.parametrize("dark", [False, True])
+def test_mode_editor_fits_dense_rows_and_narrow_columns(app, tmp_path, density, dark):
+    old_palette = app.palette()
+    palette = QPalette(old_palette)
+    if dark:
+        palette.setColor(QPalette.ColorRole.Text, QColor("white"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("white"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#222222"))
+        app.setPalette(palette)
+    try:
+        preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        preferences.setValue(DENSITY_PREFERENCE_KEY, density)
+        window = MainWindow(preferences)
+        window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Task", duration=2, resource="Alex")])
+        window.reset_history(saved=True)
+        window.show()
+        window.refresh()
+        window.tree.setColumnWidth(8, 45)
+        app.processEvents()
+        window.tree.horizontalScrollBar().setValue(window.tree.horizontalScrollBar().maximum())
+        window.tree.setCurrentItem(window.items[1], 8)
+        window.tree.editItem(window.items[1], 8)
+        app.processEvents()
+        editor = next((item for item in window.tree.findChildren(QComboBox) if item.isVisible()), None)
+        assert editor is not None and editor.currentText() == "Duration"
+        assert editor.accessibleName() == "Task scheduling mode"
+        assert editor.width() >= editor.sizeHint().width() and editor.height() >= editor.sizeHint().height()
+        assert window.tree.columnWidth(8) == 45
+        option = QStyleOptionComboBox()
+        editor.initStyleOption(option)
+        text_rect = editor.style().subControlRect(QStyle.ComplexControl.CC_ComboBox, option,
+                                                  QStyle.SubControl.SC_ComboBoxEditField, editor)
+        assert text_rect.width() >= editor.fontMetrics().horizontalAdvance("Duration")
+        assert text_rect.height() >= editor.fontMetrics().height()
+        image = editor.grab().toImage()
+        pixel = image.pixelColor(round(3 * image.devicePixelRatio()), round(3 * image.devicePixelRatio()))
+        assert pixel.red() >= 245 and pixel.green() >= 245 and pixel.blue() >= 245
+        editor.showPopup()
+        app.processEvents()
+        view = editor.view()
+        item = editor.model().index(editor.findData("work"), 0)
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         view.visualRect(item).center())
+        app.processEvents()
+        app.processEvents()
+        assert window.plan.tasks[0].mode == "work" and window.plan.tasks[0].work == 16
+        assert window.tree.columnWidth(8) == 45 and window.dirty and len(window._undo) == 1
+        window.undo()
+        assert window.plan.tasks[0].mode == "duration" and not window.dirty
+        window.close()
+    finally:
+        app.setPalette(old_palette)
+
+
+def test_mode_editor_keyboard_selection_commits_once(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Task", duration=2, resource="Alex")])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.tree.setCurrentItem(window.items[1], 8)
+    window.tree.editItem(window.items[1], 8)
+    app.processEvents()
+    editor = next(item for item in window.tree.findChildren(QComboBox) if item.isVisible())
+    QTest.keyClick(editor, Qt.Key.Key_Down)
+    app.processEvents()
+    app.processEvents()
+    assert window.plan.tasks[0].mode == "work" and window.plan.tasks[0].work == 16
+    assert len(window._undo) == 1
+    window.undo()
+    assert window.plan.tasks[0].mode == "duration" and not window.dirty
+    window.close()
+
+
+def test_summary_mode_remains_read_only(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(tasks=[Task(1, "Summary"), Task(2, "Child", parent=1)])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.tree.setCurrentItem(window.items[1], 8)
+    window.tree.editItem(window.items[1], 8)
+    app.processEvents()
+    assert not any(item.isVisible() for item in window.tree.findChildren(QComboBox))
+    assert not window.dirty and not window._undo
+    window.close()
+
+
+def test_mode_editor_escape_cancels_and_unassigned_work_is_rejected(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    preferences.setValue(DENSITY_PREFERENCE_KEY, "dense")
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Unassigned", duration=2)])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.tree.setCurrentItem(window.items[1], 8)
+    window.tree.editItem(window.items[1], 8)
+    app.processEvents()
+    editor = next(item for item in window.tree.findChildren(QComboBox) if item.isVisible())
+    editor.setCurrentIndex(editor.findData("work"))
+    QTest.keyClick(editor, Qt.Key.Key_Escape)
+    app.processEvents()
+    assert window.plan.tasks[0].mode == "duration" and not window.dirty and not window._undo
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.tree.editItem(window.items[1], 8)
+    app.processEvents()
+    editor = next(item for item in window.tree.findChildren(QComboBox) if item.isVisible())
+    editor.showPopup()
+    app.processEvents()
+    view = editor.view()
+    item = editor.model().index(editor.findData("work"), 0)
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     view.visualRect(item).center())
+    app.processEvents()
+    app.processEvents()
+    assert errors and "Assign a resource" in errors[-1]
+    assert window.plan.tasks[0].mode == "duration" and not window.dirty and not window._undo
+    window.close()
 
 
 def test_toolbar_actions_are_icon_only_with_accessible_names(app, tmp_path):
@@ -258,8 +403,10 @@ def test_toolbar_labels_are_optional_and_persist(app, tmp_path, monkeypatch):
     window.settings()
     app.processEvents()
     assert window.show_icon_labels
-    assert window.file_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+    assert window.file_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
     assert window.task_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+    assert all(window.file_toolbar.widgetForAction(action).toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+               for action in window.file_toolbar.actions())
     assert all(window.task_toolbar.widgetForAction(action).isVisible() for action in window.task_toolbar.actions())
     window.control_tabs.setCurrentIndex(0)
     app.processEvents()
@@ -267,13 +414,16 @@ def test_toolbar_labels_are_optional_and_persist(app, tmp_path, monkeypatch):
     assert not window.dirty and not window._undo
     reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
     assert reopened.show_icon_labels
+    assert reopened.file_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
     assert reopened.task_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
     def hide_names(dialog):
         dialog.show_icon_labels.setChecked(False)
         return QDialog.DialogCode.Accepted
     monkeypatch.setattr(SettingsDialog, "exec", hide_names)
     reopened.settings()
-    assert MainWindow(QSettings(path, QSettings.Format.IniFormat)).task_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
+    hidden = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert hidden.file_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
+    assert hidden.task_toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
     window.close()
 
 
@@ -287,6 +437,107 @@ def test_default_columns_fit_requested_content(app, tmp_path):
     expected_date = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
     assert window.tree.columnWidth(3) == window.tree.columnWidth(4) == expected_date
     assert window.tree.columnWidth(7) == max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
+
+
+def test_task_column_widths_persist_across_processes_and_projects(app, tmp_path):
+    path = str(tmp_path / "preferences.ini")
+    preferences = QSettings(path, QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Task")])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    app.processEvents()
+    assert not any(preferences.contains(f"{COLUMN_WIDTH_KEY}/{key}") for key in TASK_COLUMN_KEYS)
+    widths = [60, 330, 110, 125, 140, 170, 160, 85, 115]
+    for column, width in enumerate(widths):
+        window.tree.setColumnWidth(column, width)
+    assert window._column_width_sync.isActive()
+    assert not window.dirty and not window._undo
+    window.close()  # Flush even when closed before the debounce timer fires.
+    assert not window._column_width_sync.isActive()
+    assert [preferences.value(f"{COLUMN_WIDTH_KEY}/{key}", type=int) for key in TASK_COLUMN_KEYS] == widths
+    code = """
+import json, sys
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+from onepyproject.app import MainWindow
+from onepyproject.model import Plan, Task
+app = QApplication([])
+window = MainWindow(QSettings(sys.argv[1], QSettings.Format.IniFormat))
+window.plan = Plan(tasks=[Task(8, "A different project")])
+window.refresh()
+window.resize(1800, 800)
+window.show()
+app.processEvents()
+print(json.dumps([window.tree.columnWidth(i) for i in range(window.tree.columnCount())]))
+"""
+    result = subprocess.run([sys.executable, "-c", code, path], capture_output=True, text=True,
+                            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"}, check=True)
+    assert json.loads(result.stdout) == widths
+    other_user = MainWindow(QSettings(str(tmp_path / "other.ini"), QSettings.Format.IniFormat))
+    assert other_user.tree.columnWidth(1) != widths[1]
+    other_user.close()
+
+
+def test_dragging_task_header_saves_column_width(app, tmp_path):
+    path = str(tmp_path / "preferences.ini")
+    preferences = QSettings(path, QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.show()
+    app.processEvents()
+    header = window.tree.header()
+    before = header.sectionSize(1)
+    position = QPoint(header.sectionViewportPosition(1) + before - 1, header.height() // 2)
+    QTest.mousePress(header.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, position)
+    QTest.mouseMove(header.viewport(), position + QPoint(53, 0), 10)
+    QTest.mouseRelease(header.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                       position + QPoint(53, 0))
+    app.processEvents()
+    assert header.sectionSize(1) == before + 53
+    window.close()
+    assert QSettings(path, QSettings.Format.IniFormat).value(f"{COLUMN_WIDTH_KEY}/task", type=int) == before + 53
+
+
+def test_invalid_saved_column_widths_fall_back_individually(app, tmp_path):
+    default = MainWindow(QSettings(str(tmp_path / "default.ini"), QSettings.Format.IniFormat))
+    original = [default.tree.columnWidth(i) for i in range(default.tree.columnCount())]
+    preferences = QSettings(str(tmp_path / "bad.ini"), QSettings.Format.IniFormat)
+    for key, value in (("id", -1), ("task", "not-a-number"), ("duration", "0"),
+                       ("start", 10001), ("finish", True), ("resource", 180), ("work", "9" * 5000)):
+        preferences.setValue(f"{COLUMN_WIDTH_KEY}/{key}", value)
+    window = MainWindow(preferences)
+    widths = [window.tree.columnWidth(i) for i in range(window.tree.columnCount())]
+    assert widths[:5] == original[:5]
+    assert widths[6] == 180
+    assert widths[5] == original[5] and widths[7:] == original[7:]
+    assert not window._column_width_sync.isActive()
+    default.close()
+    window.close()
+
+
+def test_column_widths_sync_after_debounce_and_warn_on_failure(app, monkeypatch):
+    class FailingPreferences:
+        def value(self, _key, default, type=None):
+            return default
+        def setValue(self, _key, _value):
+            pass
+        def sync(self):
+            pass
+        def status(self):
+            return QSettings.Status.AccessError
+        def fileName(self):
+            return "/unwritable/preferences"
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    window = MainWindow(FailingPreferences())
+    window.tree.setColumnWidth(1, 345)
+    assert window._column_width_sync.isActive()
+    QTest.qWait(350)
+    assert not window._column_width_sync.isActive()
+    assert warnings and "/unwritable/preferences" in warnings[-1]
+    assert not window.dirty and not window._undo
+    window.close()
 
 
 def test_tree_branch_arrows_are_black_and_clickable_in_dark_mode(app, tmp_path):
@@ -487,7 +738,8 @@ def test_layout_density_changes_rows_without_changing_plan(app, tmp_path):
     before = schedule(window.plan)
     assert [window.density_selector.itemText(i) for i in range(window.density_selector.count())] == [
         "Comfortable", "Tight", "Dense"]
-    assert window.density == DEFAULT_DENSITY == "tight"
+    assert DENSITY_HEIGHTS == {"comfortable": 24, "tight": 20, "dense": 18}
+    assert window.density == DEFAULT_DENSITY == "comfortable"
     assert window.density_selector.parent() is window.statusBar()
     for density in ("comfortable", "tight", "dense"):
         window.density_selector.setCurrentIndex(window.density_selector.findData(density))
@@ -507,12 +759,12 @@ def test_layout_density_changes_rows_without_changing_plan(app, tmp_path):
     window.close()
 
 
-def test_unknown_saved_density_falls_back_to_tight(app, tmp_path):
+def test_unknown_saved_density_falls_back_to_comfortable(app, tmp_path):
     preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    preferences.setValue("display/density", "unknown")
+    preferences.setValue(DENSITY_PREFERENCE_KEY, "unknown")
     window = MainWindow(preferences)
-    assert window.density == "tight"
-    assert window.density_selector.currentData() == "tight"
+    assert window.density == "comfortable"
+    assert window.density_selector.currentData() == "comfortable"
 
 
 def test_existing_density_preference_is_preserved(app, tmp_path):
@@ -521,6 +773,23 @@ def test_existing_density_preference_is_preserved(app, tmp_path):
     window = MainWindow(preferences)
     assert window.density == "comfortable"
     assert window.density_selector.currentData() == "comfortable"
+
+
+@pytest.mark.parametrize("previous,expected", [("comfortable", "comfortable"), ("tight", "comfortable"), ("dense", "tight")])
+def test_old_density_preferences_keep_spacing_where_possible(app, tmp_path, previous, expected):
+    path = str(tmp_path / "density.ini")
+    preferences = QSettings(path, QSettings.Format.IniFormat)
+    preferences.setValue("display/density", previous)
+    window = MainWindow(preferences)
+    assert window.density == expected
+    assert not preferences.contains(DENSITY_PREFERENCE_KEY)
+    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
+    assert preferences.value("display/density") == previous
+    assert preferences.value(DENSITY_PREFERENCE_KEY) == "dense"
+    reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert reopened.density == "dense"
+    window.close()
+    reopened.close()
 
 
 def test_preference_write_failure_is_reported(app, monkeypatch):
@@ -578,12 +847,12 @@ def test_date_format_setting_updates_and_persists(app, tmp_path, monkeypatch):
     window.tree.setCurrentItem(window.items[1], 1)
     def choose_short(dialog):
         assert [dialog.date_format.itemText(i) for i in range(dialog.date_format.count())] == [
-            "System (default)", "11Nov HH:MM", "YYYY-MM-DD HH:MM"]
+            "System (default)", "11 Nov HH:MM", "YYYY-MM-DD HH:MM"]
         dialog.date_format.setCurrentIndex(dialog.date_format.findData("short"))
         return QDialog.DialogCode.Accepted
     monkeypatch.setattr(SettingsDialog, "exec", choose_short)
     window.settings()
-    assert window.items[1].text(3) == "11Nov"
+    assert window.items[1].text(3) == "11 Nov"
     assert window.selected_uid() == 1
     assert not window.dirty and not window._undo
     reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
@@ -799,10 +1068,139 @@ def test_insert_above_preserves_outline_and_undo(app, selected, expected):
     assert [(task.uid, task.parent) for task in window.plan.tasks] == expected
     assert next(task for task in window.plan.tasks if task.uid == 5).name == "Inserted"
     assert next(task for task in window.plan.tasks if task.uid == 3).predecessors == [2]
+    assert [window.items[task.uid].text(0) for task in window.plan.tasks] == ["1", "2", "3", "4", "5"]
+    assert window.items[3].text(5) == ("3" if selected == 1 else "2")
     window.undo()
     assert [(task.uid, task.parent) for task in window.plan.tasks] == [(1, 0), (2, 1), (3, 1), (4, 0)]
     window.redo()
     assert [(task.uid, task.parent) for task in window.plan.tasks] == expected
+    window.dirty = False
+    window.close()
+
+
+def test_display_ids_and_predecessors_follow_insert_edit_save_undo_redo(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(10, "A"), Task(70, "B", predecessors=["10SS+0.5d"]),
+        Task(20, "C", predecessors=["70FF-0.5d"]),
+    ])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.add_inline_task("Inserted", before_uid=70)
+    assert [task.uid for task in window.plan.tasks] == [10, 71, 70, 20]
+    assert [window.items[task.uid].text(0) for task in window.plan.tasks] == ["1", "2", "3", "4"]
+    assert window.items[20].text(5) == "3FF-0.5d"
+    assert window.plan.tasks[-1].predecessors == ["70FF-0.5d"]
+    window.edit_cell(20, 5, "2SS+2h, 3FF-0.5d")
+    assert window.plan.tasks[-1].predecessors == ["71SS+2h", "70FF-0.5d"]
+    assert window.items[20].text(5) == "2SS+2h, 3FF-0.5d"
+    window.tree.setCurrentItem(window.items[20], 5)
+    window.tree.editItem(window.items[20], 5)
+    app.processEvents()
+    editor = window.tree.findChild(QLineEdit)
+    assert editor is not None and editor.text() == "2SS+2h, 3FF-0.5d"
+    editor.setText("2FS+50%")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    app.processEvents()
+    app.processEvents()
+    assert window.plan.tasks[-1].predecessors == ["71FS+50%"]
+    dialog = TaskDialog(window.plan.tasks[-1], window.plan)
+    assert dialog.windowTitle() == "Task 4" and dialog.predecessors.text() == "2FS+50%"
+    dialog.predecessors.setText("1SS+1h")
+    assert window.mutate(lambda: dialog.apply(window.plan.tasks[-1], window.plan), 20)
+    assert window.plan.tasks[-1].predecessors == ["10SS+1h"]
+    window.undo()
+    assert window.items[20].text(5) == "2FS+50%"
+    window.redo()
+    assert window.items[20].text(5) == "1SS+1h"
+    path = tmp_path / "ids.pxplan"
+    window.save_onepyproject(str(path))
+    saved = load_plan(path)
+    assert [task.uid for task in saved.tasks] == [10, 71, 70, 20]
+    assert saved.tasks[-1].predecessors == ["10SS+1h"]
+    saved_bytes = path.read_bytes()
+    reopened = MainWindow(QSettings(str(tmp_path / "other-settings.ini"), QSettings.Format.IniFormat))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(path), "OnePyProject plan (*.pxplan)"))
+    reopened.open_plan()
+    assert [reopened.items[task.uid].text(0) for task in reopened.plan.tasks] == ["1", "2", "3", "4"]
+    assert reopened.items[20].text(5) == "1SS+1h"
+    assert not reopened.dirty and path.read_bytes() == saved_bytes
+    reopened.close()
+    window.close()
+
+
+def test_invalid_display_predecessor_cannot_reference_an_internal_id(app, tmp_path, monkeypatch):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(10, "A"), Task(20, "B")])
+    window.reset_history(saved=True)
+    window.refresh()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.edit_cell(20, 5, "10SS+1d")
+    assert errors and "Task ID 10 does not exist" in errors[-1]
+    assert window.plan.tasks[-1].predecessors == [] and not window.dirty
+    window.close()
+
+
+def test_unchanged_predecessor_text_retains_original_precision(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    original = "10SS+1.234567890123456789e-3d"
+    window.plan = Plan(start="2026-11-16", tasks=[Task(10, "A"), Task(90, "B", predecessors=[original])])
+    window.reset_history(saved=True)
+    window.refresh()
+    shown = window.items[90].text(5)
+    assert shown == "1SS+1.234567890123456789e-3d"
+    window.edit_cell(90, 5, shown)
+    assert window.plan.tasks[1].predecessors == [original] and not window.dirty
+    dialog = TaskDialog(window.plan.tasks[1], window.plan)
+    dialog.name.setText("Renamed")
+    assert window.mutate(lambda: dialog.apply(window.plan.tasks[1], window.plan), 90)
+    assert window.plan.tasks[1].predecessors == [original]
+    window.dirty = False
+    window.close()
+
+
+def test_delete_and_reorder_update_display_ids_but_keep_dependency_targets(app, tmp_path, monkeypatch):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(10, "Summary"), Task(20, "A", parent=10),
+                    Task(30, "B", parent=10, predecessors=["20SS+1h"]), Task(40, "Later")])
+    window.reset_history(saved=True)
+    window.refresh()
+    window.tree.setCurrentItem(window.items[20], 1)
+    window.outdent_task()
+    assert [task.uid for task in window.plan.tasks] == [10, 30, 20, 40]
+    assert window.items[30].text(0) == "2" and window.items[30].text(5) == "3SS+1h"
+    assert next(task for task in window.plan.tasks if task.uid == 30).predecessors == ["20SS+1h"]
+    window.tree.setCurrentItem(window.items[40], 1)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    window.delete_task()
+    assert [window.items[task.uid].text(0) for task in window.plan.tasks] == ["1", "2", "3"]
+    assert window.items[30].text(5) == "3SS+1h"
+    window.undo()
+    window.undo()
+    assert [task.uid for task in window.plan.tasks] == [10, 20, 30, 40]
+    assert window.items[30].text(5) == "2SS+1h"
+    window.dirty = False
+    window.close()
+
+
+def test_collapsed_children_keep_their_display_numbers(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(10, "Summary"), Task(20, "Hidden child", parent=10),
+                                                   Task(30, "Next", predecessors=[20])])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.items[10].setExpanded(False)
+    window.add_inline_task("Inserted", before_uid=30)
+    assert not window.items[10].isExpanded()
+    assert [window.items[task.uid].text(0) for task in window.plan.tasks] == ["1", "2", "3", "4"]
+    assert window.items[30].text(5) == "2"
+    window.edit_cell(30, 5, "3")
+    assert window.plan.tasks[-1].predecessors == [31]
+    assert window.items[30].text(5) == "3"
     window.dirty = False
     window.close()
 
@@ -1187,8 +1585,13 @@ def test_save_as_mpp_creates_copy_without_changing_working_save(app, tmp_path, m
     window.dirty = True
     output = tmp_path / "schedule"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(output), "Microsoft Project (*.mpp)"))
-    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(TEMPLATE), "Microsoft Project (*.mpp)"))
-    monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.Ok)
+    def choose_template(dialog):
+        dialog.template_edit.setText(str(TEMPLATE))
+        dialog.accept()
+        return dialog.result()
+    monkeypatch.setattr(ExportDialog, "exec", choose_template)
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
     monkeypatch.setattr(QMessageBox, "information", lambda *args: QMessageBox.StandardButton.Ok)
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
@@ -1202,4 +1605,4 @@ def test_save_as_mpp_creates_copy_without_changing_working_save(app, tmp_path, m
     # Saving a second time cannot overwrite the first MPP copy.
     original = written.read_bytes()
     window.save_as()
-    assert errors and written.read_bytes() == original
+    assert warnings and "does not overwrite" in warnings[-1] and written.read_bytes() == original

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from .dependencies import lag_minutes, parse_dependency
+from .dependencies import lag_minutes, parse_dependency, task_numbers
 
 
 @dataclass
@@ -201,6 +201,7 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
     tasks = {t.uid: t for t in plan.tasks}
     if len(tasks) != len(plan.tasks) or any(uid <= 0 for uid in tasks):
         raise ValueError("Task IDs must be unique positive numbers")
+    numbers = task_numbers(plan.tasks)
     resources = {resource.uid: resource for resource in plan.resources}
     if len(resources) != len(plan.resources) or any(uid <= 0 for uid in resources):
         raise ValueError("Resource IDs must be unique positive numbers")
@@ -218,41 +219,42 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
     # A preorder list ensures the outline is unambiguous and writer-compatible.
     stack: list[int] = []
     for task in plan.tasks:
+        number = numbers[task.uid]
         if not task.name.strip():
-            raise ValueError(f"Task {task.uid} needs a name")
+            raise ValueError(f"Task {number} needs a name")
         if task.parent:
             while stack and stack[-1] != task.parent:
                 stack.pop()
             if not stack:
-                raise ValueError(f"Task {task.uid} has an invalid outline")
+                raise ValueError(f"Task {number} has an invalid outline")
         else:
             stack.clear()
         children.setdefault(task.parent, []).append(task.uid)
         stack.append(task.uid)
         if task.mode not in ("duration", "work"):
-            raise ValueError(f"Task {task.uid}: invalid scheduling mode")
+            raise ValueError(f"Task {number}: invalid scheduling mode")
         if not all(math.isfinite(x) for x in (task.duration, task.work, task.units)):
-            raise ValueError(f"Task {task.uid}: numbers must be finite")
+            raise ValueError(f"Task {number}: numbers must be finite")
         if task.duration < 0 or task.work < 0 or task.units <= 0:
-            raise ValueError(f"Task {task.uid}: duration and work must be non-negative and allocation positive")
+            raise ValueError(f"Task {number}: duration and work must be non-negative and allocation positive")
         if task.assignments and task.resource.strip():
-            raise ValueError(f"Task {task.uid}: cannot mix legacy and current resource assignments")
+            raise ValueError(f"Task {number}: cannot mix legacy and current resource assignments")
         assigned = set()
         for assignment in task.assignments:
             if assignment.resource_uid not in resources:
-                raise ValueError(f"Task {task.uid}: resource {assignment.resource_uid} does not exist")
+                raise ValueError(f"Task {number}: resource {assignment.resource_uid} does not exist")
             if assignment.resource_uid in assigned:
-                raise ValueError(f"Task {task.uid}: resource assignments must be unique")
+                raise ValueError(f"Task {number}: resource assignments must be unique")
             assigned.add(assignment.resource_uid)
             if not math.isfinite(assignment.units) or assignment.units <= 0:
-                raise ValueError(f"Task {task.uid}: resource allocation must be positive")
+                raise ValueError(f"Task {number}: resource allocation must be positive")
         if task.mode == "work" and not (task.resource.strip() or task.assignments):
-            raise ValueError(f"Task {task.uid}: fixed work needs a resource")
+            raise ValueError(f"Task {number}: fixed work needs a resource")
         if task.earliest:
             date.fromisoformat(task.earliest)
         dependencies = [parse_dependency(pred) for pred in task.predecessors]
         if len({link.uid for link in dependencies}) != len(dependencies):
-            raise ValueError(f"Task {task.uid}: duplicate predecessors are not supported")
+            raise ValueError(f"Task {number}: duplicate predecessors are not supported")
 
     result: dict[int, Scheduled] = {}
     visiting: set[int] = set()
@@ -264,9 +266,10 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
             raise ValueError("Task dependencies contain a cycle")
         visiting.add(uid)
         task = tasks[uid]
+        number = numbers[uid]
         if uid in children:
             if task.predecessors:
-                raise ValueError(f"Task {uid}: summary dependencies are not supported")
+                raise ValueError(f"Task {number}: summary dependencies are not supported")
             kids = [calculate(child) for child in children[uid]]
             start, finish = min(c.start for c in kids), max(c.finish for c in kids)
             item = Scheduled(start, finish, work_between(start, finish, holidays) / 480,
@@ -276,22 +279,22 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
             if task.resource.strip():
                 units = task.units
             if not math.isfinite(units):
-                raise ValueError(f"Task {uid}: total resource allocation is too large")
+                raise ValueError(f"Task {number}: total resource allocation is too large")
             rate = 8 * units / 100
             if task.mode == "work" and (rate <= 0 or not math.isfinite(rate)):
-                raise ValueError(f"Task {uid}: total resource allocation is outside the supported range")
+                raise ValueError(f"Task {number}: total resource allocation is outside the supported range")
             duration = task.work / rate if task.mode == "work" else task.duration
             work = task.work if task.mode == "work" else duration * 8 * units / 100
             if not math.isfinite(duration) or not math.isfinite(work):
-                raise ValueError(f"Task {uid}: calculated duration or work is too large")
+                raise ValueError(f"Task {number}: calculated duration or work is too large")
             start = max(project_start, datetime.combine(date.fromisoformat(task.earliest), time(8)) if task.earliest else project_start)
             finish_bound = None
             for pred in task.predecessors:
                 link = parse_dependency(pred)
                 if link.uid not in tasks:
-                    raise ValueError(f"Task {uid}: predecessor {link.uid} does not exist")
+                    raise ValueError(f"Task {number}: predecessor internal ID {link.uid} does not exist")
                 if link.uid in children:
-                    raise ValueError(f"Task {uid}: summary predecessors are not supported")
+                    raise ValueError(f"Task {number}: summary predecessors are not supported")
                 predecessor = calculate(link.uid)
                 minutes, elapsed = lag_minutes(link, predecessor.duration)
                 anchor = predecessor.finish if link.kind in ("FS", "FF") else predecessor.start
@@ -321,7 +324,7 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
                     start = next_start(max(start, candidate), holidays)
                     finish = add_work(start, duration * 480, holidays)
                 if finish < finish_bound:
-                    raise ValueError(f"Task {uid}: cannot satisfy finish dependency")
+                    raise ValueError(f"Task {number}: cannot satisfy finish dependency")
             item = Scheduled(start, finish, duration, work)
         result[uid] = item
         visiting.remove(uid)

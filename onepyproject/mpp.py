@@ -17,7 +17,7 @@ from pymppwriter import Task as MppTask
 from pymppwriter import read_project
 
 from .model import Plan, Resource, ResourceAssignment, Task, estimated_tasks, schedule
-from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency
+from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency, task_numbers
 from .resources import migrate_legacy_resources
 from .mpp_template import strip_template_resources
 
@@ -133,6 +133,7 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         resources.append(Resource(resource.uid, name, capacities.get(resource.uid, resource.max_units * 100)))
     resource_ids = {resource.uid for resource in resources}
     task_ids = {task.uid for task in source.tasks}
+    numbers = task_numbers(source.tasks)
     if len(raw_assignments) != len(source.assignments):
         raise ValueError("Cannot safely identify MPP resource assignment units")
     assignments: dict[int, list] = {}
@@ -140,18 +141,18 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         if (assignment.task_uid, assignment.resource_uid) != (task_uid, resource_uid):
             raise ValueError("Cannot safely match MPP resource assignments")
         if task_uid not in task_ids or resource_uid not in resource_ids:
-            notes.append(f"Omitted assignment to missing task {task_uid} or resource {resource_uid}")
+            notes.append(f"Omitted assignment to missing task UID {task_uid} or resource {resource_uid}")
             continue
         if units is None:
             units = assignment.units * 100
         if units <= 0:
-            notes.append(f"Task {task_uid}: omitted resource {resource_uid} assignment with {units:g}% allocation")
+            notes.append(f"Task {numbers[task_uid]}: omitted resource {resource_uid} assignment with {units:g}% allocation")
             continue
         rows = assignments.setdefault(task_uid, [])
         existing = next((row for row in rows if row.resource_uid == resource_uid), None)
         if existing:
             existing.units += units
-            notes.append(f"Task {task_uid}: merged duplicate assignments for resource {resource_uid}")
+            notes.append(f"Task {numbers[task_uid]}: merged duplicate assignments for resource {resource_uid}")
         else:
             rows.append(ResourceAssignment(resource_uid, units))
     links: dict[int, list[int]] = {}
@@ -162,7 +163,9 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         if (pred, succ) != (rel.pred_uid, rel.succ_uid):
             raise ValueError("Cannot safely match the MPP dependencies")
         if kind not in (0, 1, 2, 3) or (raw_lag and unit != 7):
-            notes.append(f"Task {succ}: omitted dependency {pred} with unsupported MPP link type or lag unit ({unit})")
+            successor = numbers.get(succ, f"UID {succ}")
+            predecessor = numbers.get(pred, f"UID {pred}")
+            notes.append(f"Task {successor}: omitted dependency {predecessor} with unsupported MPP link type or lag unit ({unit})")
             continue
         links.setdefault(succ, []).append(format_dependency(Dependency(pred, rel.type, raw_lag / 4800, "d")))
     ids = {task.uid for task in source.tasks}
@@ -171,26 +174,27 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
     for task in source.tasks:
         assns = assignments.get(task.uid, [])
         if task.uid in summary_ids and assns:
-            notes.append(f"Task {task.uid}: summary resource assignments are retained but not scheduled")
+            notes.append(f"Task {numbers[task.uid]}: summary resource assignments are retained but not scheduled")
         task_type, hours = task_work.get(task.uid, (None, None))
         mode = "duration"
         if task.uid not in summary_ids and task_type == 2:
             if assns and hours is not None and math.isfinite(hours) and hours >= 0 and (hours > 0 or task.duration_days == 0):
                 mode = "work"
             else:
-                notes.append(f"Task {task.uid}: fixed-work data could not be represented; imported as fixed-duration")
+                notes.append(f"Task {numbers[task.uid]}: fixed-work data could not be represented; imported as fixed-duration")
         elif task.uid not in summary_ids and task_type == 0 and assns:
-            notes.append(f"Task {task.uid}: fixed-units scheduling is approximated as fixed-duration")
+            notes.append(f"Task {numbers[task.uid]}: fixed-units scheduling is approximated as fixed-duration")
         elif task.uid not in summary_ids and task_type not in (0, 1, 2) and assns:
-            notes.append(f"Task {task.uid}: unknown task type is approximated as fixed-duration")
+            notes.append(f"Task {numbers[task.uid]}: unknown task type is approximated as fixed-duration")
         predecessors = []
         for pred in links.get(task.uid, []):
             pred_uid = parse_dependency(pred).uid
             if pred_uid not in ids or pred_uid in summary_ids or task.uid in summary_ids:
-                notes.append(f"Task {task.uid}: omitted unsupported summary or missing predecessor {pred_uid}")
+                predecessor = numbers.get(pred_uid, f"UID {pred_uid}")
+                notes.append(f"Task {numbers[task.uid]}: omitted unsupported summary or missing predecessor {predecessor}")
             else:
                 predecessors.append(pred)
-        tasks.append(Task(uid=task.uid, name=task.name or f"Task {task.uid}", parent=task.parent_uid,
+        tasks.append(Task(uid=task.uid, name=task.name or f"Task {numbers[task.uid]}", parent=task.parent_uid,
                           earliest=task.start.date().isoformat(), duration=max(0, task.duration_days),
                           mode=mode, work=hours if mode == "work" else 8.0,
                           assignments=assns, predecessors=predecessors, estimated=task.estimated))
@@ -212,6 +216,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
     migrate_legacy_resources(plan)
     scheduled = schedule(plan)
     estimates = estimated_tasks(plan)
+    numbers = task_numbers(plan.tasks)
     by_uid = {task.uid: task for task in plan.tasks}
     resources = [MppResource(uid=resource.uid, name=resource.name, max_units=resource.max_units / 100)
                  for resource in plan.resources]
@@ -229,7 +234,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
                                  task_type="fixed_work" if task.mode == "work" else "fixed_duration",
                                  effort_driven=task.mode == "work"))
         if item.summary and task.assignments:
-            raise ValueError(f"Cannot export task {task.uid}: summary resource assignments are not supported")
+            raise ValueError(f"Cannot export task {numbers[task.uid]}: summary resource assignments are not supported")
         for assignment in task.assignments:
             assignments.append(MppAssignment(task.uid, assignment.resource_uid, units=assignment.units / 100))
     relations = []

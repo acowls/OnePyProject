@@ -10,32 +10,36 @@ import sys
 from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTimer, QItemSelectionModel, QSettings
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
+                               QPushButton, QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QPointF
 
 from . import __version__
 from .model import Plan, Task, descendants, estimated_tasks, indent, load_plan, outdent, save_plan, schedule
-from .dependencies import parse_dependency, parse_predecessors
+from .dependencies import parse_dependency, parse_display_predecessors, remap_predecessors, task_numbers
 from .icons import toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
 from .resources import format_task_resources, migrate_legacy_resources, overallocation_warnings, set_task_resources
 from .resource_ui import AssignResourcesDialog, ResourceSheetDialog
 from .resource_completion import ResourceCompleter
-from .ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS
+from .report import export_html
+from .report_pdf import export_pdf
+from .ui_preferences import DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY, read_density_preference
 from .preferences import application_preferences
 
 
 DATE_FORMATS = ("system", "short", "long")
 MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 EMPTY_ROW_HINT = "Double-click or press Enter to add a task, Shift+Enter to insert"
+TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors", "resource", "work", "mode")
+COLUMN_WIDTH_KEY = "display/task_column_widths"
 
 
 def display_time(value: datetime, date_format: str = "system", include_time: bool = True) -> str:
     if date_format == "short":
-        text = f"{value.day:02d}{MONTH_NAMES[value.month - 1]}"
+        text = f"{value.day:02d} {MONTH_NAMES[value.month - 1]}"
     elif date_format == "long":
         text = value.strftime("%Y-%m-%d")
     else:
@@ -211,6 +215,23 @@ class TaskDelegate(QStyledItemDelegate):
             editor = QComboBox(parent)
             editor.addItem("Duration", "duration")
             editor.addItem("Work", "work")
+            editor.setAccessibleName("Task scheduling mode")
+            arrow = (Path(__file__).resolve().parent / "assets" / "ui" / "tree_open.svg").as_posix().replace('"', '\\"')
+            # The native macOS combo is taller than dense rows and paints
+            # transparently over the cell text. Use a compact, opaque editor.
+            editor.setStyleSheet(f"""
+                QComboBox {{ color: #24354a; background: #ffffff; border: 1px solid #5484b7;
+                             border-radius: 2px; padding: 0 18px 0 3px; }}
+                QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right;
+                                        width: 16px; border: 0; }}
+                QComboBox::down-arrow {{ image: url("{arrow}"); width: 10px; height: 10px; }}
+                QComboBox QAbstractItemView {{ color: #24354a; background: #ffffff;
+                                               selection-color: #183753; selection-background-color: #d5e9fa; }}
+            """)
+            def commit_selection(_index):
+                self.commitData.emit(editor)
+                self.closeEditor.emit(editor)
+            editor.activated.connect(commit_selection)
             return editor
         editor = QLineEdit(parent)
         if index.column() == 2:
@@ -224,6 +245,19 @@ class TaskDelegate(QStyledItemDelegate):
             QTimer.singleShot(0, completer.disable_inline_preview)
         return editor
 
+    def updateEditorGeometry(self, editor, option, index):
+        if index.column() != 8 or not isinstance(editor, QComboBox):
+            return super().updateEditorGeometry(editor, option, index)
+        # Temporarily expand a narrow cell so both the full label and arrow fit,
+        # without changing the user's saved column width or row density.
+        cell = option.rect
+        viewport = editor.parentWidget()
+        width = min(viewport.width(), max(cell.width(), editor.sizeHint().width()))
+        height = min(viewport.height(), max(cell.height(), editor.sizeHint().height()))
+        x = max(0, min(cell.right() + 1 - width, viewport.width() - width))
+        y = max(0, min(cell.y() + (cell.height() - height) // 2, viewport.height() - height))
+        editor.setGeometry(x, y, width, height)
+
     def setEditorData(self, editor, index):
         uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
         if uid is None:
@@ -235,9 +269,10 @@ class TaskDelegate(QStyledItemDelegate):
         if column == 8:
             editor.setCurrentIndex(editor.findData(task.mode))
             return
+        displayed = remap_predecessors(task.predecessors, task_numbers(self.window.plan.tasks))
         values = {1: task.name, 2: f"{task.duration}{'?' if task.estimated else ''}",
                   3: task.earliest or self.window.calculated[uid].start.date().isoformat(),
-                  5: ", ".join(map(str, task.predecessors)), 6: format_task_resources(self.window.plan, task), 7: str(task.work)}
+                  5: ", ".join(map(str, displayed)), 6: format_task_resources(self.window.plan, task), 7: str(task.work)}
         editor.setText(values[column])
         editor.selectAll()
 
@@ -262,7 +297,8 @@ class TaskDelegate(QStyledItemDelegate):
 class TaskDialog(QDialog):
     def __init__(self, task: Task, plan: Plan, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Task {task.uid}")
+        numbers = task_numbers(plan.tasks)
+        self.setWindowTitle(f"Task {numbers.get(task.uid, len(plan.tasks) + 1)}")
         self.resize(430, 350)
         self.initial_mode = task.mode
         calculated = schedule(plan).get(task.uid) if any(other.uid == task.uid for other in plan.tasks) else None
@@ -301,7 +337,8 @@ class TaskDialog(QDialog):
         if self.summary:
             self.resource.setReadOnly(True)
             self.resource.setToolTip("Summary assignments cannot be added; use Assign to remove existing ones.")
-        self.predecessors = QLineEdit(", ".join(map(str, task.predecessors)))
+        self.original_predecessors = ", ".join(map(str, remap_predecessors(task.predecessors, numbers)))
+        self.predecessors = QLineEdit(self.original_predecessors)
         self.predecessors.setPlaceholderText("e.g. 5FS+2d, 6SS-1d")
         for label, widget in (("Name", self.name), ("Earliest start", self.earliest),
                               ("Scheduling", self.mode), ("Duration", self.duration), ("Estimate", self.estimated),
@@ -330,7 +367,8 @@ class TaskDialog(QDialog):
             task.work = self.display_work
         if not self.summary:
             set_task_resources(plan, task, self.resource.text())
-        task.predecessors = parse_predecessors(self.predecessors.text())
+        if self.predecessors.text() != self.original_predecessors:
+            task.predecessors = parse_display_predecessors(self.predecessors.text(), plan.tasks)
 
 
 class SettingsDialog(QDialog):
@@ -338,10 +376,12 @@ class SettingsDialog(QDialog):
                  show_icon_labels=False, settings_location=""):
         super().__init__(parent)
         self.setWindowTitle("Project settings")
-        self.resize(420, 180)
+        self.resize(650, 180)
         layout = QVBoxLayout(self)
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.title = QLineEdit(plan.title)
+        self.title.setMinimumWidth(400)
         self.start = QLineEdit(plan.start)
         self.holidays = QLineEdit(", ".join(plan.holidays))
         self.holidays.setPlaceholderText("YYYY-MM-DD, YYYY-MM-DD")
@@ -356,7 +396,7 @@ class SettingsDialog(QDialog):
         form.addRow("Toolbar", self.show_icon_labels)
         self.date_format = QComboBox()
         self.date_format.addItem("System (default)", "system")
-        self.date_format.addItem("11Nov HH:MM", "short")
+        self.date_format.addItem("11 Nov HH:MM", "short")
         self.date_format.addItem("YYYY-MM-DD HH:MM", "long")
         self.date_format.setCurrentIndex(max(0, self.date_format.findData(date_format)))
         form.addRow("Date format", self.date_format)
@@ -373,6 +413,173 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class ExportDialog(QFileDialog):
+    """Choose the destination, export type, and options in one window."""
+
+    FILTERS = {
+        "mpp": "Microsoft Project (*.mpp)",
+        "html": "Web page (*.html)",
+        "pdf": "PDF (*.pdf)",
+    }
+
+    def __init__(self, parent=None, initial_format="mpp", initial_path=None, template_hint=None, protected_paths=()):
+        super().__init__(parent)
+        self.setWindowTitle("Export project")
+        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        self.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        self.setFileMode(QFileDialog.FileMode.AnyFile)
+        self.setNameFilters(list(self.FILTERS.values()))
+        self.setLabelText(QFileDialog.DialogLabel.FileType, "Export type:")
+        self.setLabelText(QFileDialog.DialogLabel.Accept, "Export")
+        self.resize(900, 700)
+        self.output_path = None
+        self.template_path = None
+        self.template_hint = str(template_hint or "")
+        self.protected_paths = tuple(Path(path) for path in protected_paths if path is not None)
+
+        # Qt's non-native file dialog exposes its controls and permits the
+        # additional options needed alongside its standard file browser.
+        grid = self.layout()
+        type_combo = self.findChild(QComboBox, "fileTypeCombo")
+        self.filename_edit = self.findChild(QLineEdit, "fileNameEdit")
+        button_box = self.findChild(QDialogButtonBox, "buttonBox")
+        if not isinstance(grid, QGridLayout) or type_combo is None or self.filename_edit is None or button_box is None:
+            raise RuntimeError("Cannot initialize the export file dialog")
+        self._last_format = None
+        type_combo.currentIndexChanged.connect(self.update_options)
+        grid.removeWidget(button_box)
+        panel = QWidget(self)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.template_label = QLabel("MPP template")
+        self.template_edit = QLineEdit()
+        self.template_edit.setPlaceholderText("Choose a user-supplied MPP template")
+        self.template_browse = QPushButton("Browse…")
+        self.template_browse.clicked.connect(self.browse_template)
+        self.template_row = QWidget()
+        template_layout = QHBoxLayout(self.template_row)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.addWidget(self.template_edit, 1)
+        template_layout.addWidget(self.template_browse)
+        form.addRow(self.template_label, self.template_row)
+        self.paper_label = QLabel("Paper size")
+        self.paper = QComboBox()
+        self.paper.addItem("A4 landscape", "A4")
+        self.paper.addItem("A3 landscape", "A3")
+        form.addRow(self.paper_label, self.paper)
+        self.show_time = QCheckBox("Show times (HH:MM)")
+        form.addRow("", self.show_time)
+        layout.addLayout(form)
+        self.mpp_warning = QLabel(
+            EXPORT_WARNING + "\n\nAn MPP is an interchange copy, not the editable "
+            "OnePyProject working file. Save a .pxplan too to retain your work.")
+        self.mpp_warning.setWordWrap(True)
+        self.mpp_warning.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.mpp_warning.setStyleSheet("QLabel { color: #704b12; background: #fff2d6; padding: 10px; }")
+        layout.addWidget(self.mpp_warning)
+        note = QLabel("Exports are copies of the current plan, including unsaved changes.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        grid.addWidget(panel, 4, 0, 1, 3)
+        button_box.setOrientation(Qt.Orientation.Horizontal)
+        grid.addWidget(button_box, 5, 0, 1, 3)
+        self.set_format(initial_format)
+        if initial_path:
+            self.selectFile(str(initial_path))
+        self.update_options()
+
+    def selected_format(self):
+        return next((name for name, name_filter in self.FILTERS.items()
+                     if name_filter == self.selectedNameFilter()), "mpp")
+
+    def set_format(self, name):
+        self.selectNameFilter(self.FILTERS[name])
+        self.update_options()
+
+    def update_options(self, *_):
+        selected = self.selected_format()
+        if self._last_format and selected != self._last_format:
+            name = self.filename_edit.text().strip()
+            if name and Path(name).suffix.lower() in (".mpp", ".html", ".pdf"):
+                self.filename_edit.setText(str(Path(name).with_suffix(f".{selected}")))
+        self._last_format = selected
+        self.setDefaultSuffix(selected)
+        self.mpp_warning.setVisible(selected == "mpp")
+        self.template_label.setVisible(selected == "mpp")
+        self.template_row.setVisible(selected == "mpp")
+        self.show_time.setVisible(selected in ("html", "pdf"))
+        self.paper_label.setVisible(selected == "pdf")
+        self.paper.setVisible(selected == "pdf")
+
+    def browse_template(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select MPP template", self.template_edit.text() or self.template_hint,
+            "Microsoft Project (*.mpp *.MPP)")
+        if path:
+            self.template_edit.setText(path)
+
+    def accept(self):
+        try:
+            self._accept_selection()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot export", str(exc))
+
+    def _accept_selection(self):
+        name = self.filename_edit.text().strip()
+        if not name:
+            return
+        typed_path = Path(name).expanduser()
+        if not typed_path.is_absolute():
+            typed_path = Path(self.directory().absolutePath()) / typed_path
+        if typed_path.is_dir():
+            self.setDirectory(str(typed_path))
+            self.filename_edit.clear()
+            return
+        selected = self.selected_format()
+        files = self.selectedFiles()
+        if not files:
+            QMessageBox.warning(self, "Cannot export", "Enter a file name.")
+            return
+        target = Path(files[0])
+        if target.suffix.lower() == f".{selected}":
+            pass
+        elif target.suffix.lower() in (".mpp", ".html", ".pdf"):
+            target = target.with_suffix(f".{selected}")
+        else:
+            target = target.with_name(target.name + f".{selected}")
+        if not target.parent.is_dir():
+            QMessageBox.warning(self, "Cannot export", "Choose an existing destination folder.")
+            return
+        template_text = self.template_edit.text().strip()
+        template = Path(template_text).expanduser() if template_text else None
+        if template is not None and not template.is_absolute():
+            template = Path(self.directory().absolutePath()) / template
+        if selected == "mpp" and (template is None or not template.is_file()):
+            QMessageBox.warning(self, "MPP template required", "Choose an existing user-supplied MPP template.")
+            return
+        for source in (*self.protected_paths, *((template,) if template else ())):
+            if target.resolve() == source.resolve() or (target.exists() and source.exists() and target.samefile(source)):
+                QMessageBox.warning(self, "Cannot export", "Cannot overwrite the current project or MPP template.")
+                return
+        if target.exists() or target.is_symlink():
+            if selected == "mpp":
+                QMessageBox.warning(self, "Cannot export", "Choose a new file name; MPP export does not overwrite existing files.")
+                return
+            if QMessageBox.question(self, "Replace existing file?", f"Replace {target.name}?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        self.selectFile(str(target))
+        super().accept()
+        if self.result() == QDialog.DialogCode.Accepted:
+            self.output_path = target
+            self.template_path = template
 
 
 class CalendarScrollArea(QScrollArea):
@@ -507,9 +714,7 @@ class MainWindow(QMainWindow):
         self.date_format = self.preferences.value("display/date_format", "system", type=str)
         if self.date_format not in DATE_FORMATS:
             self.date_format = "system"
-        self.density = self.preferences.value("display/density", DEFAULT_DENSITY, type=str)
-        if self.density not in DENSITY_HEIGHTS:
-            self.density = DEFAULT_DENSITY
+        self.density = read_density_preference(self.preferences)
         self.plan = Plan()
         self.calculated = {}
         self.items: dict[int, QTreeWidgetItem] = {}
@@ -533,7 +738,7 @@ class MainWindow(QMainWindow):
             toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         file_actions = (("New", self.new_plan, "new"), ("Open", self.open_plan, "open"),
                         ("Save", self.save, "save"), ("Save As", self.save_as, "save_as"),
-                        ("Import", self.open_mpp, "import"), ("Export", self.save_mpp, "export"))
+                        ("Import", self.open_mpp, "import"), ("Export", self.export_project, "export"))
         task_actions = (("Settings", self.settings, "settings"), ("Resources", self.manage_resources, "resources"),
                         ("Assign", self.assign_resources, "assign"), ("+ Task", self.add_task, "task"), ("Edit", self.edit_task, "edit"),
                         ("Delete", self.delete_task, "delete"), ("Undo", self.undo, "undo"),
@@ -543,7 +748,8 @@ class MainWindow(QMainWindow):
         for toolbar, entries in ((self.file_toolbar, file_actions), (self.task_toolbar, task_actions)):
             for title, handler, icon in entries:
                 action = QAction(toolbar_icon(icon), title, self)
-                action.triggered.connect(handler)
+                if handler is not None:
+                    action.triggered.connect(handler)
                 action.setToolTip(title)
                 if title == "Undo":
                     self.undo_action = action
@@ -553,8 +759,10 @@ class MainWindow(QMainWindow):
                     self.redo_action = action
                     action.setShortcuts(QKeySequence.StandardKey.Redo)
                     self.addAction(action)
-                elif title in ("Import", "Export"):
-                    action.setToolTip(f"{title} an MPP file")
+                elif title == "Import":
+                    action.setToolTip("Import an MPP file")
+                elif title == "Export":
+                    action.setToolTip("Export an MPP, HTML or PDF copy")
                 toolbar.addAction(action)
                 toolbar.widgetForAction(action).setAccessibleName(title)
         self.apply_toolbar_labels()
@@ -626,8 +834,11 @@ class MainWindow(QMainWindow):
         delegate = TaskDelegate(self)
         delegate.closeEditor.connect(self.tree.editor_closed)
         self.tree.setItemDelegate(delegate)
-        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header_metrics = self.tree.header().fontMetrics()
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setMaximumSectionSize(10000)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header_metrics = header.fontMetrics()
         bold_font = QFont(self.tree.font())
         bold_font.setBold(True)
         data_metrics = QFontMetrics(bold_font)
@@ -635,6 +846,15 @@ class MainWindow(QMainWindow):
         date_width = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
         work_width = max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
         for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90)):
+            value = self.preferences.value(f"{COLUMN_WIDTH_KEY}/{TASK_COLUMN_KEYS[i]}", None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                saved_width = value
+            elif isinstance(value, str) and len(value) <= 5 and value.isascii() and value.isdecimal():
+                saved_width = int(value)
+            else:
+                saved_width = 0
+            if header.minimumSectionSize() <= saved_width <= header.maximumSectionSize():
+                width = saved_width
             self.tree.setColumnWidth(i, width)
         splitter.addWidget(self.tree)
         self.chart_area = CalendarScrollArea(self)
@@ -668,6 +888,11 @@ class MainWindow(QMainWindow):
         self.density_selector.currentIndexChanged.connect(self.change_density)
         self.update_zoom_controls()
         self.refresh()
+        self._column_width_sync = QTimer(self)
+        self._column_width_sync.setSingleShot(True)
+        self._column_width_sync.setInterval(300)
+        self._column_width_sync.timeout.connect(self.sync_preferences)
+        header.sectionResized.connect(self.save_column_width)
         if preferences is None and self.preferences.status() != QSettings.Status.NoError:
             QTimer.singleShot(0, self.sync_preferences)
 
@@ -697,15 +922,20 @@ class MainWindow(QMainWindow):
         if density not in DENSITY_HEIGHTS or density == self.density:
             return
         self.density = density
-        self.preferences.setValue("display/density", density)
+        self.preferences.setValue(DENSITY_PREFERENCE_KEY, density)
         self.sync_preferences()
         self.apply_density()
 
+    def save_column_width(self, index, _old_width, new_width):
+        if 0 <= index < len(TASK_COLUMN_KEYS):
+            self.preferences.setValue(f"{COLUMN_WIDTH_KEY}/{TASK_COLUMN_KEYS[index]}", new_width)
+            self._column_width_sync.start()
+
     def apply_toolbar_labels(self):
-        self.file_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon if self.show_icon_labels
-                                             else Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.task_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon if self.show_icon_labels
-                                             else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        style = (Qt.ToolButtonStyle.ToolButtonTextUnderIcon if self.show_icon_labels
+                 else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.file_toolbar.setToolButtonStyle(style)
+        self.task_toolbar.setToolButtonStyle(style)
 
     def sync_preferences(self):
         self.preferences.sync()
@@ -758,6 +988,7 @@ class MainWindow(QMainWindow):
         self.calculated = schedule(self.plan)
         self.resource_warnings = overallocation_warnings(self.plan)
         estimates = estimated_tasks(self.plan)
+        numbers = task_numbers(self.plan.tasks)
         self.tree.insertion = self.tree.insertion_before = None
         self.tree.clear()
         self.items = {}
@@ -766,9 +997,9 @@ class MainWindow(QMainWindow):
             show_time = 0 < item.duration < 1
             start = display_time(item.start, self.date_format, include_time=show_time)
             finish = display_time(item.finish, self.date_format, include_time=show_time)
-            values = [str(task.uid), task.name, f"{item.duration:g} d{'?' if estimates[task.uid] else ''}",
+            values = [str(numbers[task.uid]), task.name, f"{item.duration:g} d{'?' if estimates[task.uid] else ''}",
                       start, finish,
-                      ", ".join(map(str, task.predecessors)), format_task_resources(self.plan, task),
+                      ", ".join(map(str, remap_predecessors(task.predecessors, numbers))), format_task_resources(self.plan, task),
                       f"{item.work:g} h", "Work" if task.mode == "work" else "Duration"]
             node = QTreeWidgetItem(values)
             node.setData(0, Qt.ItemDataRole.UserRole, task.uid)
@@ -776,7 +1007,7 @@ class MainWindow(QMainWindow):
             node.setToolTip(2, "A question mark indicates an estimated duration.")
             node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
             node.setToolTip(4, display_time(item.finish, self.date_format))
-            node.setToolTip(5, "Predecessors: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas.")
+            node.setToolTip(5, "Use displayed task IDs: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas.")
             if item.summary and (task.assignments or task.resource.strip()):
                 node.setToolTip(6, "Summary resources are retained but not included in scheduling or MPP export.")
             elif any(assignment.resource_uid in self.resource_warnings for assignment in task.assignments):
@@ -899,7 +1130,10 @@ class MainWindow(QMainWindow):
                     return
                 task.earliest = date.fromisoformat(text).isoformat() if text else ""
             elif column == 5:
-                task.predecessors = parse_predecessors(text)
+                current = ", ".join(map(str, remap_predecessors(task.predecessors, task_numbers(self.plan.tasks))))
+                if text == current.strip():
+                    return
+                task.predecessors = parse_display_predecessors(text, self.plan.tasks)
             elif column == 6:
                 set_task_resources(self.plan, task, text)
             elif column == 7:
@@ -949,6 +1183,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.confirm_discard():
+            if self._column_width_sync.isActive():
+                self._column_width_sync.stop()
+                self.sync_preferences()
             event.accept()
         else:
             event.ignore()
@@ -992,7 +1229,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         if file_type == "Microsoft Project (*.mpp)" or path.lower().endswith(".mpp"):
-            self.export_mpp_copy(path)
+            self.show_export_dialog("mpp", path)
             return
         self.save_onepyproject(path)
 
@@ -1031,32 +1268,32 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Cannot import MPP", str(exc))
 
-    def save_mpp(self):
-        self.export_mpp_copy()
+    def export_project(self):
+        self.show_export_dialog()
 
-    def export_mpp_copy(self, path=None):
-        warning = (EXPORT_WARNING + "\n\nAn MPP is an interchange copy, not the editable "
-                   "OnePyProject working file. Save a .pxplan too to retain your work.")
-        if QMessageBox.warning(self, "Experimental MPP export", warning,
-                               QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
-            return
-        template, _ = QFileDialog.getOpenFileName(self, "Select MPP template", str(self.template), "Microsoft Project (*.mpp)")
-        if not template:
-            return
-        self.template = Path(template)
-        if not path:
-            path, _ = QFileDialog.getSaveFileName(self, "Export to a NEW MPP file", "", "Microsoft Project (*.mpp)")
-        if not path:
-            return
-        if not path.lower().endswith(".mpp"):
-            path += ".mpp"
+    def show_export_dialog(self, initial_format="mpp", output_path=None):
         try:
-            notes = export_mpp(self.plan, template, path, (self.import_path,) if self.import_path else ())
-            QMessageBox.information(self, "MPP exported", "Saved a new MPP copy. Verify it in Microsoft Project. "
-                                    "Save a .pxplan to keep your editable working file." +
-                                    ("\n\nWriter warnings:\n" + "\n".join(notes) if notes else ""))
+            initial_path = output_path or (self.plan_path.with_suffix(f".{initial_format}") if self.plan_path else None)
+            dialog = ExportDialog(self, initial_format, initial_path, self.template,
+                                  (self.plan_path, self.import_path, self.template))
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.output_path is None:
+                return
+            path = dialog.output_path
+            selected = dialog.selected_format()
+            if selected == "mpp":
+                self.template = dialog.template_path
+                notes = export_mpp(self.plan, self.template, path, (self.import_path,) if self.import_path else ())
+                QMessageBox.information(self, "MPP exported", "Saved a new MPP copy. Verify it in Microsoft Project. "
+                                        "Save a .pxplan to keep your editable working file." +
+                                        ("\n\nWriter warnings:\n" + "\n".join(notes) if notes else ""))
+            elif selected == "html":
+                export_html(self.plan, path, dialog.show_time.isChecked())
+                self.statusBar().showMessage(f"Exported read-only web page: {path.name}")
+            elif selected == "pdf":
+                export_pdf(self.plan, path, dialog.paper.currentData(), dialog.show_time.isChecked())
+                self.statusBar().showMessage(f"Exported read-only PDF: {path.name}")
         except Exception as exc:
-            QMessageBox.critical(self, "Cannot export MPP", str(exc))
+            QMessageBox.critical(self, "Cannot export project", str(exc))
 
     def settings(self):
         dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,

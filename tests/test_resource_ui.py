@@ -57,6 +57,7 @@ def test_resource_dialogs_follow_layout_density(app):
     tight = ResourceSheetDialog(plan, density="tight")
     dense = ResourceSheetDialog(plan, density="dense")
     assert comfortable.table.rowHeight(0) > tight.table.rowHeight(0) > dense.table.rowHeight(0)
+    assert comfortable.table.rowHeight(0) == DENSITY_HEIGHTS["comfortable"]
     assert tight.table.rowHeight(0) == DENSITY_HEIGHTS["tight"]
     assert dense.table.rowHeight(0) == DENSITY_HEIGHTS["dense"]
     assignments = AssignResourcesDialog(plan, plan.tasks[0], density="dense")
@@ -101,6 +102,18 @@ def test_resource_sheet_protects_assigned_resources_and_validates_names(app, mon
     dialog.accept()
     assert dialog.result() != QDialog.DialogCode.Accepted
     assert "non-empty" in messages[-1]
+
+
+def test_resource_warning_uses_display_task_number(app, monkeypatch):
+    plan = Plan(resources=[Resource(1, "Ada")], tasks=[Task(40, "First"),
+                Task(99, "Assigned", assignments=[ResourceAssignment(1)])])
+    dialog = ResourceSheetDialog(plan)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: messages.append(args[-1]))
+    dialog.table.setCurrentCell(0, 1)
+    dialog.remove_resource()
+    assert "Assigned task IDs: 2" in messages[-1]
+    assert dialog.table.rowCount() == 1
 
 
 def test_assign_dialog_supports_multiple_percentages_and_fixed_work_guard(app, monkeypatch):

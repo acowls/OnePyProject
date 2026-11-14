@@ -3,8 +3,26 @@ import json
 
 import pytest
 
-from onepyproject.dependencies import parse_dependency, parse_predecessors
+from onepyproject.dependencies import parse_dependency, parse_display_predecessors, parse_predecessors, remap_predecessors, task_numbers
 from onepyproject.model import Plan, Task, indent, load_plan, outdent, save_plan, schedule
+
+
+def test_display_ids_remap_dependency_text_without_changing_precision():
+    tasks = [Task(30, "A"), Task(2, "B"), Task(100, "C")]
+    mapping = task_numbers(tasks)
+    assert mapping == {30: 1, 2: 2, 100: 3}
+    original = [30, "100SS+1.234567890123456789e-3d", " 2FF-50%"]
+    assert remap_predecessors(original, mapping) == [1, "3SS+1.234567890123456789e-3d", " 2FF-50%"]
+    assert original == [30, "100SS+1.234567890123456789e-3d", " 2FF-50%"]
+    assert parse_display_predecessors("1, 3SS+2h", tasks) == [30, "100SS+2h"]
+    with pytest.raises(ValueError, match="Task ID 30 does not exist"):
+        parse_display_predecessors("30", tasks)
+
+
+def test_schedule_errors_use_display_task_numbers():
+    plan = Plan(tasks=[Task(10, "Valid"), Task(99, "")])
+    with pytest.raises(ValueError, match="Task 2 needs a name"):
+        schedule(plan)
 
 
 def test_working_days_holiday_milestone_and_summary():

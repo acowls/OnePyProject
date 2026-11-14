@@ -37,6 +37,34 @@ def test_export_and_read_back(tmp_path):
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_mpp_display_ids_follow_order_while_stable_uids_and_links_survive(tmp_path):
+    from pymppwriter import blocks
+    from pymppwriter.reader import _Klass, _Reader
+    from pymppwriter.writer import NATIVE, TASK_META_SIZE, TASK_META2_SIZE
+    from onepyproject.report import make_report
+
+    plan = Plan(start="2026-11-16", tasks=[Task(30, "A"), Task(90, "Inserted"),
+                    Task(10, "B", predecessors=["90SS+2h"])])
+    output = tmp_path / "reordered.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    reader = _Reader(str(output))
+    task_records = _Klass(reader, "   114/TBkndTask", TASK_META_SIZE, TASK_META2_SIZE, blocks.PROPS_TASK_FIELD_MAP)
+    ids = []
+    for index, record in enumerate(task_records.recs):
+        if len(record) <= 100:
+            continue
+        uid = task_records.value(index, NATIVE["UNIQUE_ID"], "<I")
+        if uid:
+            ids.append((uid, task_records.value(index, NATIVE["ID"], "<I")))
+    assert ids == [(30, 1), (90, 2), (10, 3)]
+    imported, _ = import_mpp(output)
+    assert [task.uid for task in imported.tasks] == [30, 90, 10]
+    link = parse_dependency(imported.tasks[-1].predecessors[0])
+    assert (link.uid, link.kind, link.lag, link.unit) == (90, "SS", 0.25, "d")
+    assert make_report(imported).rows[-1].predecessors == "2SS+0.25d"
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
 def test_import_existing_template():
     plan, _ = import_mpp(TEMPLATE)
     assert plan.tasks

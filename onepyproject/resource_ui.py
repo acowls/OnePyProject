@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox, QDo
 
 from .model import Plan, Resource, ResourceAssignment, Task, schedule
 from .resources import migrate_legacy_resources, overallocation_warnings
+from .dependencies import task_numbers
 from .ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS
 
 
@@ -37,9 +38,8 @@ class ResourceSheetDialog(QDialog):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["ID", "Resource name", "Max units %", "Status"])
         self.table.verticalHeader().setVisible(False)
-        if density != "comfortable":
-            self.table.verticalHeader().setMinimumSectionSize(0)
-            self.table.verticalHeader().setDefaultSectionSize(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
+        self.table.verticalHeader().setMinimumSectionSize(0)
+        self.table.verticalHeader().setDefaultSectionSize(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -94,7 +94,8 @@ class ResourceSheetDialog(QDialog):
         if row < 0:
             return
         uid = int(self.table.item(row, 0).text())
-        affected = [task.uid for task in self.plan.tasks if any(a.resource_uid == uid for a in task.assignments)]
+        numbers = task_numbers(self.plan.tasks)
+        affected = [numbers[task.uid] for task in self.plan.tasks if any(a.resource_uid == uid for a in task.assignments)]
         if affected:
             QMessageBox.warning(self, "Resource is assigned",
                                 "Remove this resource from its tasks before deleting it. "
@@ -165,9 +166,8 @@ class AssignResourcesDialog(QDialog):
         layout.addWidget(note)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Assign", "Resource", "Allocation %", "Max %"])
-        if density != "comfortable":
-            self.table.verticalHeader().setMinimumSectionSize(0)
-            self.table.verticalHeader().setDefaultSectionSize(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
+        self.table.verticalHeader().setMinimumSectionSize(0)
+        self.table.verticalHeader().setDefaultSectionSize(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 65)
         self.table.setColumnWidth(2, 110)
@@ -190,9 +190,8 @@ class AssignResourcesDialog(QDialog):
             units.setDecimals(decimals)
             units.setRange(10 ** -decimals, max(10000, original))
             units.setValue(original)
-            if density != "comfortable":
-                units.setMinimumHeight(0)
-                units.setMaximumHeight(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
+            units.setMinimumHeight(0)
+            units.setMaximumHeight(DENSITY_HEIGHTS.get(density, DENSITY_HEIGHTS[DEFAULT_DENSITY]))
             units.setToolTip(f"Exact allocation: {original:.17g}%")
             units.setProperty("original_allocation", original)
             units.setProperty("allocation_changed", False)
