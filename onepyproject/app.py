@@ -12,7 +12,7 @@ from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTi
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QPointF
@@ -149,6 +149,10 @@ class TaskTree(QTreeWidget):
         if self.window.ai_preview is not None and event.type() in (QEvent.Type.MouseButtonPress,
                                                                     QEvent.Type.MouseButtonDblClick):
             return True
+        if (event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton
+                and self.state() != QAbstractItemView.State.EditingState):
+            self.select_context_item(event.position().toPoint())
+            return True
         if (event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier
                 and self.state() != QAbstractItemView.State.EditingState and self.placeholder is not None
@@ -163,6 +167,31 @@ class TaskTree(QTreeWidget):
                 self.editItem(self.placeholder, 1)
                 return True
         return super().viewportEvent(event)
+
+    def select_context_item(self, position):
+        self.select_context_node(self.itemAt(position))
+
+    def select_context_node(self, item):
+        if item is None or item in (self.placeholder, self.insertion):
+            self.clearSelection()
+            if self.placeholder is not None:
+                self.setCurrentItem(self.placeholder, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+            return
+        if not item.isSelected():
+            self.setCurrentItem(item, 0, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+        else:
+            self.setCurrentItem(item, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def contextMenuEvent(self, event):
+        if self.window.ai_preview is not None or self.state() == QAbstractItemView.State.EditingState:
+            return
+        if event.reason() != event.Reason.Keyboard:
+            self.select_context_item(event.pos())
+        menu = self.window.task_context_menu(self)
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            menu.deleteLater()
 
     def insert_above_current(self):
         uid = self.window.selected_uid()
@@ -685,6 +714,24 @@ class Gantt(QWidget):
             return day.strftime("%b %Y")
         return ""
 
+    def contextMenuEvent(self, event):
+        tree = self.window.tree
+        if self.window.ai_preview is not None or tree.state() == QAbstractItemView.State.EditingState:
+            return
+        if event.reason() != event.Reason.Keyboard:
+            y = event.pos().y() - tree.header().height()
+            if y < 0 or y >= tree.viewport().height():
+                return
+            item = next((node for node in self.window.items.values()
+                         if not tree.visualItemRect(node).isEmpty()
+                         and tree.visualItemRect(node).top() <= y <= tree.visualItemRect(node).bottom()), None)
+            tree.select_context_node(item)
+        menu = self.window.task_context_menu(tree)
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            menu.deleteLater()
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -712,6 +759,10 @@ class Gantt(QWidget):
             if label:
                 p.setPen(QColor("#68788c"))
                 p.drawText(x + 3, 19, label)
+        # Rows may have negative viewport coordinates when the tree scrolls.
+        # Clip all bars and links below the fixed date header.
+        p.save()
+        p.setClipRect(QRectF(0, header, self.width(), max(0, self.height() - header)), Qt.ClipOperation.IntersectClip)
         today = (date.today() - self.origin).days * self.DAY
         p.setPen(QPen(QColor("#55a378"), 1, Qt.PenStyle.DashLine))
         p.drawLine(today, header, today, self.height())
@@ -764,6 +815,7 @@ class Gantt(QWidget):
                 p.drawLine(int(px), int(py), int(elbow), int(py))
                 p.drawLine(int(elbow), int(py), int(elbow), int(sy))
                 p.drawLine(int(elbow), int(sy), int(endpoint), int(sy))
+        p.restore()
         p.end()
 
     def draw_preview_bar(self, painter, item, y, proposed=False):
@@ -1049,6 +1101,61 @@ class MainWindow(QMainWindow):
     def selected_uids(self):
         selected = {item.data(0, Qt.ItemDataRole.UserRole) for item in self.tree.selectedItems()}
         return [task.uid for task in self.plan.tasks if task.uid in selected]
+
+    def task_context_menu(self, parent=None):
+        """Build actions for the current selection without changing toolbar state."""
+        selected = self.selected_uids()
+        selected_set = set(selected)
+        source = self.plan
+        revision = plan_revision(source)
+        editable = self.ai_preview is None
+        rows = get_rows() if editable else None
+        can_paste = rows is not None
+        if can_paste and rows.cut:
+            anchor = selected[-1] if selected else None
+            try:
+                can_paste = (rows.source() is self and self.plan is rows.source_plan
+                             and plan_revision(self.plan) == rows.source_revision
+                             and anchor not in {task.uid for task in rows.tasks})
+            except ProposalError:
+                can_paste = False
+        can_unlink = len(selected) >= 2 and any(
+            parse_dependency(value).uid in selected_set
+            for task in self.plan.tasks if task.uid in selected_set for value in task.predecessors)
+        can_link = False
+        if len(selected) >= 2 and all(not self.calculated[uid].summary for uid in selected):
+            candidate = copy.deepcopy(self.plan)
+            by_uid = {task.uid: task for task in candidate.tasks}
+            for pred, succ in zip(selected, selected[1:]):
+                if pred not in {parse_dependency(value).uid for value in by_uid[succ].predecessors}:
+                    by_uid[succ].predecessors.append(pred)
+                    can_link = True
+            if can_link:
+                try:
+                    schedule(candidate)
+                except (ValueError, KeyError, OverflowError, RecursionError):
+                    can_link = False
+        menu = QMenu(parent or self.tree)
+        actions = (("Cut", self.cut_rows, self.cut_action.icon(), bool(selected)),
+                   ("Copy", self.copy_rows, self.copy_action.icon(), bool(selected)),
+                   ("Paste", self.paste_rows, self.paste_action.icon(), can_paste),
+                   ("Edit", self.edit_task, toolbar_icon("edit"), len(selected) == 1),
+                   ("Delete", self.delete_task, toolbar_icon("delete"), len(selected) == 1),
+                   ("Unlink", self.unlink_tasks, toolbar_icon("unlink"), can_unlink),
+                   ("Link", self.link_tasks, toolbar_icon("link"), can_link),
+                   ("New task", self.add_task, toolbar_icon("task"), True))
+        for label, handler, icon, enabled in actions:
+            action = menu.addAction(icon, label)
+            action.setEnabled(editable and enabled)
+            def invoke(checked=False, callback=handler):
+                if self.ai_preview is not None:
+                    return
+                if self.plan is not source or plan_revision(self.plan) != revision or self.selected_uids() != selected:
+                    self.statusBar().showMessage("The project or selection changed; open the menu again.", 5000)
+                    return
+                callback()
+            action.triggered.connect(invoke)
+        return menu
 
     def copy_rows(self):
         if self.ai_preview is None and put_rows(self, self.selected_uids()):

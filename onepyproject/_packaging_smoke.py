@@ -125,9 +125,17 @@ def run():
         window.show()
         window.refresh()
         app.processEvents()
+        window.tree.setCurrentItem(window.items[20], 1)
+        context = window.task_context_menu()
+        actions = {action.text(): action for action in context.actions()}
+        if not actions["Copy"].isEnabled() or actions["Link"].isEnabled():
+            raise RuntimeError("Task context menu state is incorrect")
+        context.deleteLater()
         window.open_ai()
         if window._ai_dialog.send.icon().pixmap(QSize(20, 20)).isNull():
             raise RuntimeError("AI composer icon failed to render")
+        if "Example" not in window._ai_dialog.prompt._resource_names():
+            raise RuntimeError("AI resource mention suggestions are unavailable")
         window.show_ai_preview(plan, candidate)
         app.processEvents()
         if not window.ai_preview.rows or window.gantt.grab().isNull():

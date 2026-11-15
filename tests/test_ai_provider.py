@@ -136,6 +136,7 @@ def test_history_prompt_and_cached_tokens_are_sent_and_reported():
     assert calls["messages"][1:3] == history
     assert "Prefer milestones" in calls["messages"][0]["content"]
     assert "The project snapshot" in calls["messages"][0]["content"]
+    assert "@Craig" in calls["messages"][0]["content"] and "stable resource reference" in calls["messages"][0]["content"]
     assert calls["reasoning_effort"] == "high"
     assert result.prompt_tokens == 90 and result.completion_tokens == 10 and result.cached_prompt_tokens == 25
 

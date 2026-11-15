@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
                                QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget)
 
 from .diff import compare_plans
+from .mentions import ResourceMentionEdit
 from .proposals import ProposalError, make_snapshot, plan_revision
 from .provider import (DEFAULT_BASE_PROMPT, EFFORTS, MAX_BASE_PROMPT, CredentialStore, ProviderError, discover_models,
                        normalize_config, request_proposal, validate_api_key)
@@ -251,7 +252,7 @@ class AIAssistantDock(QDockWidget):
         proposal_actions.addWidget(self.discard)
         proposal_actions.addWidget(self.accept)
         layout.addLayout(proposal_actions)
-        self.prompt = QPlainTextEdit()
+        self.prompt = ResourceMentionEdit(self.window)
         self.prompt.setPlaceholderText("Ask for a change or refine the preview…")
         self.prompt.setAccessibleName("Ask AI")
         self.prompt.setMaximumHeight(110)
