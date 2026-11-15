@@ -30,10 +30,9 @@ IMPORT_WARNING = (
     "Keep the original MPP and verify the imported schedule."
 )
 EXPORT_WARNING = (
-    "MPP export is experimental and may lose or change data. pymppwriter also retains "
-    "some streams and metadata from the selected template, which may contain private "
-    "information. The generated schedule has not been validated by Microsoft Project. "
-    "Keep originals and check the exported file in Microsoft Project before sharing it."
+    "An empty MPP template is required to save this project as an MPP. "
+    "Some metadata may be retained from the template in the saved file.\n\n"
+    "MPP support is experimental. Save OnePyProject (.pxplan) to retain your work."
 )
 
 

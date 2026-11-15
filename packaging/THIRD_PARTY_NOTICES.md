@@ -15,6 +15,9 @@ image-format and platform plugins; those need their own distribution audit.
 - olefile: BSD-style and PIL licences; included in `licenses/olefile.txt`.
 - Icons8 Flat Color Icons: MIT option; included in `licenses/icons8.txt`.
 - PyInstaller: GPL with a bootloader exception; included in `licenses/pyinstaller.txt`.
+- OpenAI Python SDK: Apache 2.0; included in `licenses/openai.txt`.
+- Python keyring: MIT; included in `licenses/keyring.txt`.
+- Additional SDK and credential-store dependencies have their own licences; their distribution metadata is included in the app and requires review.
 - Python has its own licences: https://docs.python.org/3/license.html.
 
 This is an incomplete inventory, **not a distribution compliance statement**.

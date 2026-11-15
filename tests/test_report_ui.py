@@ -50,7 +50,12 @@ def test_export_dialog_shows_destination_and_options_on_one_page(app, tmp_path):
     assert dialog.filename_edit.isVisible() and dialog.filename_edit.text() == "example.mpp"
     assert Path(dialog.directory().absolutePath()).resolve() == tmp_path.resolve()
     assert dialog.template_row.isVisible() and not dialog.template_edit.text()
-    assert dialog.mpp_warning.isVisible() and EXPORT_WARNING in dialog.mpp_warning.text()
+    assert dialog.mpp_warning.isVisible() and dialog.mpp_warning.text() == EXPORT_WARNING
+    assert EXPORT_WARNING == (
+        "An empty MPP template is required to save this project as an MPP. "
+        "Some metadata may be retained from the template in the saved file.\n\n"
+        "MPP support is experimental. Save OnePyProject (.pxplan) to retain your work."
+    )
     assert not dialog.show_time.isVisible() and not dialog.paper.isVisible()
     dialog.set_format("html")
     assert dialog.filename_edit.text() == "example.html"

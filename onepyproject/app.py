@@ -3,16 +3,17 @@ from __future__ import annotations
 
 import copy
 from datetime import date, datetime, timedelta
+from html import escape
 import math
 from pathlib import Path
 import sys
 
 from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTimer, QItemSelectionModel, QSettings
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
+                               QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QPointF
 
@@ -26,8 +27,11 @@ from .resource_ui import AssignResourcesDialog, ResourceSheetDialog
 from .resource_completion import ResourceCompleter
 from .report import export_html
 from .report_pdf import export_pdf
-from .ui_preferences import DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY, read_density_preference
+from .ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY, read_density_preference
 from .preferences import application_preferences
+from .ai.proposals import ProposalError, plan_revision
+from .ai.preview import CHANGED_CELL, ROW_COLORS, build_preview
+from .ai.ui import AIAssistantDock
 
 
 DATE_FORMATS = ("system", "short", "long")
@@ -74,6 +78,13 @@ class TaskTree(QTreeWidget):
         self.duration_editor = None
 
     def event(self, event):
+        if self.window.ai_preview is not None and event.type() == QEvent.Type.KeyPress:
+            bar = self.verticalScrollBar()
+            key = event.key()
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                delta = bar.pageStep() if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown) else bar.singleStep()
+                bar.setValue(bar.value() + (-delta if key in (Qt.Key.Key_Up, Qt.Key.Key_PageUp) else delta))
+            return True
         if event.type() == QEvent.Type.KeyPress and self.state() != QAbstractItemView.State.EditingState:
             key = event.key()
             modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
@@ -128,6 +139,9 @@ class TaskTree(QTreeWidget):
             editor.setFocus()
 
     def viewportEvent(self, event):
+        if self.window.ai_preview is not None and event.type() in (QEvent.Type.MouseButtonPress,
+                                                                    QEvent.Type.MouseButtonDblClick):
+            return True
         if (event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier
                 and self.state() != QAbstractItemView.State.EditingState and self.placeholder is not None
@@ -205,6 +219,8 @@ class TaskDelegate(QStyledItemDelegate):
         return super().eventFilter(editor, event)
 
     def createEditor(self, parent, option, index):
+        if self.window.ai_preview is not None:
+            return None
         uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
         if uid is None and index.column() == 1:
             return QLineEdit(parent)
@@ -373,24 +389,44 @@ class TaskDialog(QDialog):
 
 class SettingsDialog(QDialog):
     def __init__(self, plan: Plan, parent=None, digit_edits_duration=True, date_format="system",
-                 show_icon_labels=False, settings_location=""):
+                 show_icon_labels=False, settings_location="", confirm_task_deletion=True, density=DEFAULT_DENSITY):
         super().__init__(parent)
-        self.setWindowTitle("Project settings")
-        self.resize(650, 180)
+        self.setWindowTitle("Settings")
+        self.resize(650, 420)
         layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::pane { background: palette(window); }")
+        project_tab = QWidget()
+        project_layout = QVBoxLayout(project_tab)
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.title = QLineEdit(plan.title)
         self.title.setMinimumWidth(400)
         self.start = QLineEdit(plan.start)
-        self.holidays = QLineEdit(", ".join(plan.holidays))
-        self.holidays.setPlaceholderText("YYYY-MM-DD, YYYY-MM-DD")
+        self.holidays = QPlainTextEdit("\n".join(plan.holidays))
+        self.holidays.setAccessibleName("Project holidays")
+        self.holidays.setPlaceholderText("One date per line: YYYY-MM-DD")
+        self.holidays.setMinimumHeight(120)
         form.addRow("Project name", self.title)
         form.addRow("Start date", self.start)
         form.addRow("Holidays", self.holidays)
+        project_layout.addLayout(form)
+        hint = QLabel("Working time: Monday–Friday, 08:00–12:00 and 13:00–17:00. Enter holidays one per line or separated by commas.")
+        hint.setWordWrap(True)
+        project_layout.addWidget(hint)
+        project_layout.addStretch()
+        self.tabs.addTab(project_tab, "Project-specific settings")
+        preferences_tab = QWidget()
+        preferences_layout = QVBoxLayout(preferences_tab)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.digit_edits_duration = QCheckBox("Type digits on a task to edit its duration")
         self.digit_edits_duration.setChecked(digit_edits_duration)
         form.addRow("Keyboard", self.digit_edits_duration)
+        self.confirm_task_deletion = QCheckBox("Confirm before deleting a task")
+        self.confirm_task_deletion.setChecked(confirm_task_deletion)
+        self.confirm_task_deletion.setToolTip("Deleting a summary also deletes its subtasks and their dependency links. Undo can restore them.")
+        form.addRow("Deletion", self.confirm_task_deletion)
         self.show_icon_labels = QCheckBox("Show toolbar icon names")
         self.show_icon_labels.setChecked(show_icon_labels)
         form.addRow("Toolbar", self.show_icon_labels)
@@ -400,15 +436,22 @@ class SettingsDialog(QDialog):
         self.date_format.addItem("YYYY-MM-DD HH:MM", "long")
         self.date_format.setCurrentIndex(max(0, self.date_format.findData(date_format)))
         form.addRow("Date format", self.date_format)
+        self.density_selector = QComboBox()
+        self.density_selector.setAccessibleName("Layout density")
+        self.density_selector.setToolTip("Choose the compactness of task and resource rows")
+        for name in DENSITY_HEIGHTS:
+            self.density_selector.addItem(name.capitalize(), name)
+        self.density_selector.setCurrentIndex(max(0, self.density_selector.findData(density)))
+        form.addRow("Layout", self.density_selector)
         self.settings_location = QLineEdit(settings_location)
         self.settings_location.setReadOnly(True)
         self.settings_location.setCursorPosition(0)
         self.settings_location.setToolTip("Application preferences are stored separately from the project file.\n" + settings_location)
         form.addRow("Preferences location", self.settings_location)
-        layout.addLayout(form)
-        hint = QLabel("Working time: Monday–Friday, 08:00–12:00 and 13:00–17:00.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        preferences_layout.addLayout(form)
+        preferences_layout.addStretch()
+        self.tabs.addTab(preferences_tab, "User preferences")
+        layout.addWidget(self.tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -476,9 +519,7 @@ class ExportDialog(QFileDialog):
         self.show_time = QCheckBox("Show times (HH:MM)")
         form.addRow("", self.show_time)
         layout.addLayout(form)
-        self.mpp_warning = QLabel(
-            EXPORT_WARNING + "\n\nAn MPP is an interchange copy, not the editable "
-            "OnePyProject working file. Save a .pxplan too to retain your work.")
+        self.mpp_warning = QLabel(EXPORT_WARNING)
         self.mpp_warning.setWordWrap(True)
         self.mpp_warning.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.mpp_warning.setStyleSheet("QLabel { color: #704b12; background: #fff2d6; padding: 10px; }")
@@ -606,6 +647,8 @@ class Gantt(QWidget):
 
     def sync(self):
         values = list(self.window.calculated.values())
+        if self.window.ai_preview is not None:
+            values = [item for row in self.window.ai_preview.rows for item in (row.before, row.after) if item]
         if values:
             self.origin = min(v.start.date() for v in values) - timedelta(days=7)
             finish = max(v.finish.date() for v in values) + timedelta(days=21)
@@ -616,8 +659,10 @@ class Gantt(QWidget):
         # Fill the viewport even when zoomed out on a short project.
         viewport_width = self.window.chart_area.viewport().width()
         self.days = max(self.days, math.ceil(viewport_width / self.DAY) + 14)
-        # Qt widget dimensions have an upper limit.
-        self.days = min(self.days, 5000)
+        # Preview must span both schedules, even when the proposal moves a date
+        # beyond the normal chart horizon. Stay within Qt's widget-size limit.
+        limit = 16_000_000 // self.DAY if self.window.ai_preview is not None else 5000
+        self.days = min(self.days, limit)
         self.resize(self.days * self.DAY, max(150, self.window.tree.height()))
         self.update()
 
@@ -639,6 +684,12 @@ class Gantt(QWidget):
         p.fillRect(event.rect(), QColor("#ffffff"))
         tree = self.window.tree
         header = tree.header().height()
+        preview = self.window.ai_preview
+        if preview is not None:
+            for row in preview.rows:
+                rect = tree.visualItemRect(self.window.items[row.uid])
+                if not rect.isEmpty() and row.status in ROW_COLORS:
+                    p.fillRect(0, header + rect.top(), self.width(), rect.height(), QColor(ROW_COLORS[row.status]))
         p.fillRect(0, 0, self.width(), header, QColor("#f4f6f9"))
         clip = event.rect()
         first = max(0, clip.left() // self.DAY)
@@ -646,7 +697,7 @@ class Gantt(QWidget):
         for n in range(first, last):
             day = self.origin + timedelta(days=n)
             x = n * self.DAY
-            if day.weekday() >= 5:
+            if day.weekday() >= 5 and preview is None:
                 p.fillRect(x, header, self.DAY, self.height() - header, QColor("#f6f7f9"))
             p.setPen(QPen(QColor("#e9edf2"), 1))
             p.drawLine(x, header, x, self.height())
@@ -659,17 +710,23 @@ class Gantt(QWidget):
         p.drawLine(today, header, today, self.height())
 
         positions = {}
+        preview_rows = {row.uid: row for row in preview.rows} if preview else {}
         for uid, tree_item in self.window.items.items():
             rect = tree.visualItemRect(tree_item)
             if rect.isEmpty():
                 continue
             y = header + rect.center().y()
-            item = self.window.calculated[uid]
+            row = preview_rows.get(uid)
+            item = (row.before or row.after) if row else self.window.calculated[uid]
             start, finish = self.x(item.start), self.x(item.finish)
             positions[uid] = (start, finish, y)
             p.setPen(QPen(QColor("#e9edf2"), 1))
             p.drawLine(0, header + rect.bottom(), self.width(), header + rect.bottom())
-            if item.summary:
+            if row is not None:
+                self.draw_preview_bar(p, item, y, proposed=row.before is None)
+                if row.before and row.after and (row.before.start != row.after.start or row.before.finish != row.after.finish):
+                    self.draw_preview_bar(p, row.after, y, proposed=True)
+            elif item.summary:
                 p.setPen(QPen(QColor("#343c49"), 3))
                 p.drawLine(int(start), int(y - 3), int(max(start + 2, finish)), int(y - 3))
                 p.drawLine(int(start), int(y - 3), int(start), int(y + 4))
@@ -685,7 +742,7 @@ class Gantt(QWidget):
                 p.drawRoundedRect(QRectF(start, y - 6, max(5, finish - start), 12), 2, 2)
         # Draw FS links for visible rows, without affecting bar hit testing.
         p.setPen(QPen(QColor("#5484b7"), 1))
-        for task in self.window.plan.tasks:
+        for task in (() if preview else self.window.plan.tasks):
             if task.uid not in positions:
                 continue
             sx, sf, sy = positions[task.uid]
@@ -702,6 +759,17 @@ class Gantt(QWidget):
                 p.drawLine(int(elbow), int(sy), int(endpoint), int(sy))
         p.end()
 
+    def draw_preview_bar(self, painter, item, y, proposed=False):
+        start, finish = self.x(item.start), self.x(item.finish)
+        painter.setBrush(QColor("#357ab8" if proposed else "#a9cdec"))
+        painter.setPen(QPen(QColor("#18598f"), 1.5, Qt.PenStyle.DashLine) if proposed else Qt.PenStyle.NoPen)
+        if item.duration == 0:
+            painter.drawPolygon(QPolygonF([QPointF(start, y - 6), QPointF(start + 6, y),
+                                           QPointF(start, y + 6), QPointF(start - 6, y)]))
+        else:
+            height = 8 if proposed else 12
+            painter.drawRoundedRect(QRectF(start, y - height / 2, max(5, finish - start), height), 2, 2)
+
 
 class MainWindow(QMainWindow):
     ZOOM_STEPS = (5, 8, 13, 18, 26)
@@ -710,6 +778,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.preferences = preferences if preferences is not None else application_preferences()
         self.digit_edits_duration = self.preferences.value("keyboard/digit_edits_duration", True, type=bool)
+        self.confirm_task_deletion = self.preferences.value("editing/confirm_task_deletion", True, type=bool)
         self.show_icon_labels = self.preferences.value("display/show_icon_labels", False, type=bool)
         self.date_format = self.preferences.value("display/date_format", "system", type=str)
         if self.date_format not in DATE_FORMATS:
@@ -725,6 +794,9 @@ class MainWindow(QMainWindow):
         self._saved_plan: Plan | None = copy.deepcopy(self.plan)
         self._undo: list[tuple[Plan, list[int]]] = []
         self._redo: list[tuple[Plan, list[int]]] = []
+        self._ai_dialog = None
+        self.ai_preview = None
+        self._preview_state = None
         saved_zoom = self.preferences.value("display/zoom_width", 26, type=int)
         self.zoom_index = self.ZOOM_STEPS.index(saved_zoom) if saved_zoom in self.ZOOM_STEPS else self.ZOOM_STEPS.index(26)
         self.setWindowTitle(f"OnePyProject {__version__}")
@@ -795,25 +867,19 @@ class MainWindow(QMainWindow):
         self.zoom_in_button.setAccessibleName("Zoom in")
         self.zoom_in_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.zoom_in_button.clicked.connect(self.zoom_in)
-        self.density_label = QLabel("Layout")
-        self.density_label.setStyleSheet("color: #f3f7fb; padding: 0 3px;")
-        self.density_selector = QComboBox()
-        self.density_selector.setAccessibleName("Layout density")
-        self.density_selector.setToolTip("Choose the compactness of task and resource rows")
-        for name in DENSITY_HEIGHTS:
-            self.density_selector.addItem(name.capitalize(), name)
-        self.density_selector.setCurrentIndex(self.density_selector.findData(self.density))
-        self.density_selector.setStyleSheet("""
-            QComboBox { color: #17334a; background: #edf3f7; border: 1px solid #a3b3bf;
-                        border-radius: 4px; padding: 2px 6px; }
-            QComboBox QAbstractItemView { color: #17334a; background: #edf3f7;
-                                         selection-color: #17334a; selection-background-color: #cfe2f1; }
-        """)
-        self.statusBar().addPermanentWidget(self.density_label)
-        self.statusBar().addPermanentWidget(self.density_selector)
+        self.ai_button = QToolButton()
+        icon_path = Path(__file__).resolve().parent / "assets" / "ui" / "ai_assistant.svg"
+        self.ai_button.setIcon(QIcon(str(icon_path)))
+        self.ai_button.setIconSize(QSize(20, 20))
+        self.ai_button.setStyleSheet(zoom_style)
+        self.ai_button.setToolTip("Open or hide the AI assistant")
+        self.ai_button.setAccessibleName("AI assistant")
+        self.ai_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.ai_button.clicked.connect(self.open_ai)
         self.statusBar().addPermanentWidget(self.zoom_out_button)
         self.statusBar().addPermanentWidget(self.zoom_indicator)
         self.statusBar().addPermanentWidget(self.zoom_in_button)
+        self.statusBar().addPermanentWidget(self.ai_button)
         splitter = QSplitter()
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -885,7 +951,6 @@ class MainWindow(QMainWindow):
         """)
         self.zoom_indicator.setFixedWidth(self.zoom_indicator.sizeHint().width())
         self.apply_density()
-        self.density_selector.currentIndexChanged.connect(self.change_density)
         self.update_zoom_controls()
         self.refresh()
         self._column_width_sync = QTimer(self)
@@ -916,15 +981,6 @@ class MainWindow(QMainWindow):
         self.tree.doItemsLayout()
         if hasattr(self, "gantt"):
             self.gantt.sync()
-
-    def change_density(self, _index):
-        density = self.density_selector.currentData()
-        if density not in DENSITY_HEIGHTS or density == self.density:
-            return
-        self.density = density
-        self.preferences.setValue(DENSITY_PREFERENCE_KEY, density)
-        self.sync_preferences()
-        self.apply_density()
 
     def save_column_width(self, index, _old_width, new_width):
         if 0 <= index < len(TASK_COLUMN_KEYS):
@@ -1057,6 +1113,8 @@ class MainWindow(QMainWindow):
         self.redo_action.setEnabled(bool(self._redo))
 
     def mutate(self, callback, selected=None):
+        if self.ai_preview is not None:
+            return False
         old = copy.deepcopy(self.plan)
         old_selection = self.selected_uids()
         try:
@@ -1075,6 +1133,134 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot update project", str(exc))
             return False
 
+    def open_ai(self):
+        if self._ai_dialog is None:
+            self._ai_dialog = AIAssistantDock(self)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._ai_dialog)
+            self.resizeDocks([self._ai_dialog], [360], Qt.Orientation.Horizontal)
+        elif not self._ai_dialog.isHidden():
+            self._ai_dialog.hide()
+            return
+        self._ai_dialog.show()
+        self._ai_dialog.raise_()
+
+    def show_ai_preview(self, before, after):
+        preview = build_preview(before, after, lambda value, include_time=True:
+                                display_time(value, self.date_format, include_time=include_time))
+        if self.ai_preview is None:
+            self._preview_state = {
+                "expanded": {uid for uid, item in self.items.items() if item.isExpanded()},
+                "selection": self.selected_uids(), "vertical": self.tree.verticalScrollBar().value(),
+                "horizontal": self.chart_area.horizontalScrollBar().value(),
+                "tree_horizontal": self.tree.horizontalScrollBar().value(),
+                "actions": {action: action.isEnabled() for action in self.task_toolbar.actions()},
+            }
+        previous_preview = self.ai_preview
+        self.ai_preview = preview
+        self.file_toolbar.setEnabled(False)
+        for action in self.task_toolbar.actions():
+            action.setEnabled(False)
+        self.zoom_out_button.setEnabled(False)
+        self.zoom_in_button.setEnabled(False)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tree.setItemsExpandable(False)
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        try:
+            self._render_ai_preview()
+        except Exception:
+            if previous_preview is None:
+                self.clear_ai_preview()
+            else:
+                self.ai_preview = previous_preview
+                self._render_ai_preview()
+            raise
+
+    def _render_ai_preview(self):
+        previous = self.tree.verticalScrollBar().value()
+        self.tree.clear()
+        self.tree.placeholder = self.tree.insertion = self.tree.insertion_before = None
+        self.items = {}
+        for row in self.ai_preview.rows:
+            node = QTreeWidgetItem(list(row.values))
+            node.setData(0, Qt.ItemDataRole.UserRole, row.uid)
+            node.setFlags(node.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            for col in range(9):
+                color = CHANGED_CELL if row.status == "changed" and col in row.changed_columns else ROW_COLORS.get(row.status)
+                if color:
+                    node.setBackground(col, QColor(color))
+                if row.previous is not None and col in row.changed_columns:
+                    node.setToolTip(col, "<p>Current: " + escape(row.previous[col]) + "<br>Proposed: " +
+                                    escape(row.values[col]) + "</p>")
+            if row.details:
+                node.setToolTip(1, row.details)
+            item = row.after or row.before
+            if item and item.summary:
+                font = QFont()
+                font.setBold(True)
+                for col in range(9):
+                    node.setFont(col, font)
+            if row.parent:
+                self.items[row.parent].addChild(node)
+            else:
+                self.tree.addTopLevelItem(node)
+            self.items[row.uid] = node
+            node.setExpanded(True)
+        self.tree.verticalScrollBar().setValue(previous)
+        self.gantt.sync()
+        self.statusBar().showMessage("AI preview — read-only. Green: added; red: removed; yellow: changed.")
+
+    def clear_ai_preview(self):
+        if self.ai_preview is None:
+            return
+        state = self._preview_state
+        self.ai_preview = None
+        self._preview_state = None
+        self.file_toolbar.setEnabled(True)
+        for action, enabled in state["actions"].items():
+            action.setEnabled(enabled)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.setItemsExpandable(True)
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.refresh(state["selection"])
+        for uid, node in self.items.items():
+            node.setExpanded(uid in state["expanded"])
+        self.tree.verticalScrollBar().setValue(state["vertical"])
+        self.tree.horizontalScrollBar().setValue(state["tree_horizontal"])
+        self.chart_area.horizontalScrollBar().setValue(state["horizontal"])
+        self.update_zoom_controls()
+        self.gantt.update()
+
+    def apply_ai_candidate(self, source, expected_revision, candidate, candidate_revision):
+        """Apply a reviewed candidate as one atomic undoable working-plan edit."""
+        if self.ai_preview is not None:
+            raise ProposalError("Close the preview before applying the proposal.")
+        if self.plan is not source or plan_revision(self.plan) != expected_revision:
+            raise ProposalError("The project changed; request a new proposal before applying.")
+        if plan_revision(candidate) != candidate_revision:
+            raise ProposalError("The proposal changed; request a new preview before applying.")
+        updated = copy.deepcopy(candidate)
+        schedule(updated)
+        overallocation_warnings(updated)
+        if updated == self.plan:
+            raise ProposalError("The proposal no longer changes the project.")
+        old_plan, old_undo, old_redo, old_dirty = self.plan, self._undo, self._redo, self.dirty
+        selection = self.selected_uids()
+        try:
+            self.plan = updated
+            self._undo = (old_undo + [(copy.deepcopy(old_plan), selection)])[-100:]
+            self._redo = []
+            self.dirty = self._saved_plan is None or self.plan != self._saved_plan
+            self.refresh(selection)
+        except Exception as exc:
+            self.plan, self._undo, self._redo, self.dirty = old_plan, old_undo, old_redo, old_dirty
+            try:
+                self.refresh(selection)
+            except Exception:
+                pass
+            raise ProposalError("Could not apply the proposal; the working plan was restored.") from exc
+
     def reset_history(self, saved):
         self._undo.clear()
         self._redo.clear()
@@ -1082,7 +1268,7 @@ class MainWindow(QMainWindow):
         self.dirty = not saved
 
     def undo(self):
-        if not self._undo:
+        if self.ai_preview is not None or not self._undo:
             return
         self._redo.append((copy.deepcopy(self.plan), self.selected_uids()))
         self.plan, selected = self._undo.pop()
@@ -1090,7 +1276,7 @@ class MainWindow(QMainWindow):
         self.refresh(selected)
 
     def redo(self):
-        if not self._redo:
+        if self.ai_preview is not None or not self._redo:
             return
         self._undo.append((copy.deepcopy(self.plan), self.selected_uids()))
         self.plan, selected = self._redo.pop()
@@ -1183,6 +1369,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.confirm_discard():
+            if self._ai_dialog is not None:
+                self._ai_dialog.cancel_request()
+                self.clear_ai_preview()
+                self._ai_dialog.close()
             if self._column_width_sync.isActive():
                 self._column_width_sync.stop()
                 self.sync_preferences()
@@ -1297,22 +1487,30 @@ class MainWindow(QMainWindow):
 
     def settings(self):
         dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,
-                                self.show_icon_labels, self.preferences.fileName())
+                                self.show_icon_labels, self.preferences.fileName(), self.confirm_task_deletion, self.density)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             def update():
                 self.plan.title = dialog.title.text().strip() or "Untitled project"
                 self.plan.start = dialog.start.text().strip()
-                self.plan.holidays = [d.strip() for d in dialog.holidays.text().split(",") if d.strip()]
+                self.plan.holidays = [day.strip() for line in dialog.holidays.toPlainText().splitlines()
+                                      for day in line.split(",") if day.strip()]
             if self.mutate(update, self.selected_uid()):
                 self.digit_edits_duration = dialog.digit_edits_duration.isChecked()
+                self.confirm_task_deletion = dialog.confirm_task_deletion.isChecked()
                 self.show_icon_labels = dialog.show_icon_labels.isChecked()
+                previous_density = self.density
+                self.density = dialog.density_selector.currentData()
                 previous_date_format = self.date_format
                 self.date_format = dialog.date_format.currentData()
                 self.preferences.setValue("keyboard/digit_edits_duration", self.digit_edits_duration)
+                self.preferences.setValue("editing/confirm_task_deletion", self.confirm_task_deletion)
+                self.preferences.setValue(DENSITY_PREFERENCE_KEY, self.density)
                 self.preferences.setValue("display/show_icon_labels", self.show_icon_labels)
                 self.preferences.setValue("display/date_format", self.date_format)
                 self.sync_preferences()
                 self.apply_toolbar_labels()
+                if self.density != previous_density:
+                    self.apply_density()
                 if self.date_format != previous_date_format:
                     self.refresh()
 
@@ -1378,7 +1576,8 @@ class MainWindow(QMainWindow):
         if uid is None:
             return
         ids = descendants(self.plan, uid)
-        if QMessageBox.question(self, "Delete task", f"Delete {len(ids)} task(s) and their dependency links?") != QMessageBox.StandardButton.Yes:
+        if (self.confirm_task_deletion and
+                QMessageBox.question(self, "Delete task", f"Delete {len(ids)} task(s) and their dependency links?") != QMessageBox.StandardButton.Yes):
             return
         def delete():
             self.plan.tasks = [t for t in self.plan.tasks if t.uid not in ids]

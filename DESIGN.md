@@ -54,7 +54,15 @@ Alternatives considered: Aspose.Tasks can write MPP but was rejected because it 
 - Tab indents; Shift+Tab outdents. Delete or Backspace removes the selected task after confirmation, including descendants and their links. Normal text-editing keys continue to work in an open editor.
 - Select multiple tasks and choose Link for finish-to-start links in row order, or Unlink to remove links between those selected tasks.
 - Undo/redo stores up to 100 in-memory changes, with platform-standard keyboard shortcuts. Opening or creating another project resets that history. The saved `.pxplan` determines the clean/dirty state.
-- A `?` suffix marks an estimated duration, for example `2d?`; removing it marks the duration confirmed. Task details also expose the flag. A summary displays `?` when marked estimated itself or when a descendant is estimated. Estimates are stored in `.pxplan` and mapped to MPP where supported.
+- A `?` suffix marks an estimated duration, for example `2d?`; removing it marks the duration confirmed. Task details also expose the flag. A summary displays `?` when marked estimated itself or when a descendant is estimated. Estimates are stored in `.pxplan` and mapped to MPP where supported. AI-created tasks and tasks with AI-generated duration/work are not marked estimated; unrelated existing flags are preserved.
+
+### AI proposal and review
+
+- AI is opt-in and uses a user-supplied Foundry resource endpoint, deployment name and API key. It does not use OAuth, Entra or a hosted agent. The key is session-only unless the user explicitly stores it in the macOS or Windows credential store; regular settings contain no key.
+- The user approves a data-sharing disclosure once per endpoint and deployment. Each request sends a bounded current or staged project snapshot, the session conversation and editable base planning prompt. Fixed safety instructions cannot be edited. The model has no filesystem, shell or mutation tools and can only return bounded, versioned operations. Stable task/resource IDs are distinct from displayed task numbers.
+- Operations apply to a detached copy and are compared with the original working-plan baseline. The main grid and Gantt show a read-only colored overlay; the dock lists direct and calculated impacts, including project and resource changes. Refinements use the staged candidate, and deleted baseline IDs are reserved. An accepted batch is one undoable edit; a rejected, invalid or stale proposal changes nothing. Save remains explicit.
+- Conversation and reported usage are held in memory for the session, while configuration and disclosure approval are per-user preferences. Remote retention, monitoring, location and charges depend on the deployment. Only compatible Foundry v1 chat-completion deployments with structured outputs are supported. Imported MPP limitations and the scheduler's lack of automatic resource levelling still apply.
+- The sidebar selects configured deployment names and can query Foundry model IDs, which are not assumed to be deployed. Reasoning effort defaults to the model's default and unsupported values fail visibly. The session-only permission shield defaults to review; auto-accept still validates, rejects stale results and makes one undoable edit without saving. An existing preview always requires explicit acceptance or discard.
 
 ## 5. Scheduling model
 

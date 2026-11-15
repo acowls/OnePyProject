@@ -12,13 +12,20 @@ datas = [
 ]
 datas += collect_data_files("pymppwriter")
 datas += copy_metadata("pymppwriter") + copy_metadata("olefile")
+datas += copy_metadata("openai", recursive=True) + copy_metadata("keyring", recursive=True)
+
+hiddenimports = ["PySide6.QtSvg"]
+if sys.platform == "darwin":
+    hiddenimports.append("keyring.backends.macOS")
+elif sys.platform == "win32":
+    hiddenimports.append("keyring.backends.Windows")
 
 a = Analysis(
     [str(root / "packaging" / "frozen_entry.py")],
     pathex=[str(root)],
     binaries=[],
     datas=datas,
-    hiddenimports=["PySide6.QtSvg"],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

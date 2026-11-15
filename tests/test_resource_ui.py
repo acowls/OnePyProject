@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from onepyproject.app import MainWindow, TaskDialog
+from onepyproject.app import MainWindow, SettingsDialog, TaskDialog
 from onepyproject.model import Plan, Resource, ResourceAssignment, Task, load_plan, schedule
 from onepyproject.resource_ui import AssignResourcesDialog, ResourceSheetDialog
 from onepyproject.resources import format_task_resources
@@ -75,7 +75,11 @@ def test_mainwindow_passes_density_to_resource_dialogs(app, tmp_path, monkeypatc
     window.reset_history(saved=True)
     window.refresh()
     window.tree.setCurrentItem(window.items[1], 1)
-    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
+    def choose_density(dialog):
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", choose_density)
+    window.settings()
     seen = []
     def reject(dialog):
         seen.append(dialog.table.rowHeight(0))

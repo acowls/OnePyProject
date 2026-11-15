@@ -1,5 +1,6 @@
 import os
 import json
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -10,7 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
-from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, QSize, QTime, Qt
+from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, QSize, QTime, QTimer, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QLineEdit, QMessageBox,
                                QStyle, QStyleOptionComboBox)
@@ -28,6 +29,14 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "template.mpp"
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+def set_density_in_settings(window, density, monkeypatch):
+    def choose(dialog):
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData(density))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", choose)
+    window.settings()
 
 
 def test_task_text_stays_dark_with_dark_system_palette(app):
@@ -149,21 +158,77 @@ def test_digit_duration_setting_persists_and_can_be_disabled(app, tmp_path, monk
     reopened.close()
 
 
+def test_task_deletion_confirmation_setting_persists_and_undo_restores_subtree(app, tmp_path, monkeypatch):
+    path = str(tmp_path / "settings.ini")
+    window = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Summary"), Task(2, "Child", parent=1),
+                                                   Task(3, "Later", predecessors=[2])])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.tree.setCurrentItem(window.items[1], 1)
+    questions = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: questions.append(args) or QMessageBox.StandardButton.No)
+    window.delete_task()
+    assert len(questions) == 1 and len(window.plan.tasks) == 3 and not window.dirty
+    def disable(dialog):
+        assert dialog.confirm_task_deletion.isChecked()
+        dialog.confirm_task_deletion.setChecked(False)
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", disable)
+    window.settings()
+    assert not window.confirm_task_deletion and not window.dirty and not window._undo
+    reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert not reopened.confirm_task_deletion
+    reopened.plan = deepcopy(window.plan)
+    reopened.reset_history(saved=True)
+    reopened.show()
+    reopened.refresh()
+    reopened.tree.setCurrentItem(reopened.items[1], 1)
+    def unexpected(*args):
+        raise AssertionError("Deletion confirmation is disabled")
+    monkeypatch.setattr(QMessageBox, "question", unexpected)
+    QTest.keyClick(reopened.tree, Qt.Key.Key_Delete)
+    assert [(task.uid, task.predecessors) for task in reopened.plan.tasks] == [(3, [])]
+    assert reopened.dirty and len(reopened._undo) == 1
+    reopened.undo()
+    assert [task.uid for task in reopened.plan.tasks] == [1, 2, 3]
+    assert reopened.plan.tasks[-1].predecessors == [2] and not reopened.dirty
+    reopened.redo()
+    assert [task.uid for task in reopened.plan.tasks] == [3]
+    reopened.undo()
+    def enable(dialog):
+        assert not dialog.confirm_task_deletion.isChecked()
+        dialog.confirm_task_deletion.setChecked(True)
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", enable)
+    reopened.settings()
+    assert MainWindow(QSettings(path, QSettings.Format.IniFormat)).confirm_task_deletion
+    reopened.close()
+    window.close()
+
+
 def test_cancelled_or_invalid_settings_do_not_change_preference(app, tmp_path, monkeypatch):
     preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     window = MainWindow(preferences)
     def cancel(dialog):
         dialog.digit_edits_duration.setChecked(False)
+        dialog.confirm_task_deletion.setChecked(False)
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
         dialog.show_icon_labels.setChecked(True)
         dialog.date_format.setCurrentIndex(dialog.date_format.findData("short"))
         return QDialog.DialogCode.Rejected
     monkeypatch.setattr(SettingsDialog, "exec", cancel)
     window.settings()
     assert window.digit_edits_duration
+    assert window.confirm_task_deletion
+    assert window.density == "comfortable" and not preferences.contains(DENSITY_PREFERENCE_KEY)
     assert not window.show_icon_labels
     assert window.date_format == "system"
     def invalid(dialog):
         dialog.digit_edits_duration.setChecked(False)
+        dialog.confirm_task_deletion.setChecked(False)
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
         dialog.show_icon_labels.setChecked(True)
         dialog.date_format.setCurrentIndex(dialog.date_format.findData("short"))
         dialog.start.setText("invalid")
@@ -172,6 +237,8 @@ def test_cancelled_or_invalid_settings_do_not_change_preference(app, tmp_path, m
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.Ok)
     window.settings()
     assert window.digit_edits_duration
+    assert window.confirm_task_deletion and not preferences.contains("editing/confirm_task_deletion")
+    assert window.density == "comfortable" and not preferences.contains(DENSITY_PREFERENCE_KEY)
     assert not preferences.contains("keyboard/digit_edits_duration")
     assert not window.show_icon_labels and not preferences.contains("display/show_icon_labels")
     assert window.date_format == "system" and not preferences.contains("display/date_format")
@@ -222,6 +289,48 @@ def test_settings_project_name_field_is_wide_and_resizable(app):
     app.processEvents()
     assert dialog.title.width() >= original_width + 150
     dialog.close()
+
+
+def test_settings_separates_project_and_user_preferences_and_holidays_are_multiline(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", holidays=["2026-12-25", "2027-01-01"], tasks=[Task(1, "Task")])
+    window.reset_history(saved=True)
+    window.refresh()
+    def edit(dialog):
+        assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == ["Project-specific settings", "User preferences"]
+        project, user = dialog.tabs.widget(0), dialog.tabs.widget(1)
+        assert all(project.isAncestorOf(widget) for widget in (dialog.title, dialog.start, dialog.holidays))
+        assert all(user.isAncestorOf(widget) for widget in (dialog.density_selector, dialog.date_format,
+                                                              dialog.confirm_task_deletion, dialog.settings_location))
+        assert dialog.holidays.toPlainText() == "2026-12-25\n2027-01-01"
+        dialog.holidays.setPlainText("2026-12-24, 2026-12-25\n\n2027-01-01\n")
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", edit)
+    window.settings()
+    assert window.plan.holidays == ["2026-12-24", "2026-12-25", "2027-01-01"]
+    assert window.density == "dense" and window.dirty and len(window._undo) == 1
+    window.undo()
+    assert window.plan.holidays == ["2026-12-25", "2027-01-01"] and not window.dirty
+    assert window.density == "dense"
+    window.close()
+
+
+def test_invalid_multiline_holiday_does_not_save_preferences(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    def invalid(dialog):
+        dialog.holidays.setPlainText("2026-12-25\nnot-a-date")
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", invalid)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.settings()
+    assert errors and window.plan.holidays == [] and not window.dirty
+    assert window.density == "comfortable" and not preferences.contains(DENSITY_PREFERENCE_KEY)
+    window.close()
 
 
 @pytest.mark.parametrize("density", ["comfortable", "tight", "dense"])
@@ -372,6 +481,8 @@ def test_toolbar_actions_are_icon_only_with_accessible_names(app, tmp_path):
     assert window.zoom_in_button.accessibleName() == "Zoom in"
     assert window.zoom_out_button.parent() is window.statusBar()
     assert window.zoom_in_button.parent() is window.statusBar()
+    assert window.ai_button.parent() is window.statusBar()
+    assert window.ai_button.accessibleName() == "AI assistant" and not window.ai_button.icon().isNull()
     window.resize(1000, 700)
     window.show()
     app.processEvents()
@@ -382,6 +493,8 @@ def test_toolbar_actions_are_icon_only_with_accessible_names(app, tmp_path):
     assert window.file_toolbar.isVisible() and not window.task_toolbar.isVisible()
     assert window.zoom_out_button.isVisible()
     assert window.zoom_in_button.isVisible()
+    assert window.ai_button.isVisible()
+    assert window.zoom_in_button.x() < window.ai_button.x()
     window.close()
 
 
@@ -697,12 +810,12 @@ def test_gantt_zoom_preserves_schedule_and_view_center(app, tmp_path):
 def test_application_preferences_persist_together(app, tmp_path, monkeypatch):
     path = str(tmp_path / "preferences.ini")
     window = MainWindow(QSettings(path, QSettings.Format.IniFormat))
-    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
     window.zoom_out()
     def change_preferences(dialog):
         dialog.show_icon_labels.setChecked(True)
         dialog.digit_edits_duration.setChecked(False)
         dialog.date_format.setCurrentIndex(dialog.date_format.findData("long"))
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
         return QDialog.DialogCode.Accepted
     monkeypatch.setattr(SettingsDialog, "exec", change_preferences)
     window.settings()
@@ -726,7 +839,7 @@ print(json.dumps([window.show_icon_labels, window.digit_edits_duration,
     assert json.loads(result.stdout) == [True, False, "long", "dense", "69%"]
 
 
-def test_layout_density_changes_rows_without_changing_plan(app, tmp_path):
+def test_layout_density_changes_rows_without_changing_plan(app, tmp_path, monkeypatch):
     settings_path = str(tmp_path / "settings.ini")
     window = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
     window.plan = Plan(start="2026-11-16", tasks=[Task(1, "First"), Task(2, "Second")])
@@ -736,13 +849,14 @@ def test_layout_density_changes_rows_without_changing_plan(app, tmp_path):
     app.processEvents()
     window.tree.setCurrentItem(window.items[2], 1)
     before = schedule(window.plan)
-    assert [window.density_selector.itemText(i) for i in range(window.density_selector.count())] == [
+    dialog = SettingsDialog(window.plan, window, density=window.density)
+    assert [dialog.density_selector.itemText(i) for i in range(dialog.density_selector.count())] == [
         "Comfortable", "Tight", "Dense"]
     assert DENSITY_HEIGHTS == {"comfortable": 24, "tight": 20, "dense": 18}
     assert window.density == DEFAULT_DENSITY == "comfortable"
-    assert window.density_selector.parent() is window.statusBar()
+    assert dialog.density_selector.currentData() == "comfortable"
     for density in ("comfortable", "tight", "dense"):
-        window.density_selector.setCurrentIndex(window.density_selector.findData(density))
+        set_density_in_settings(window, density, monkeypatch)
         app.processEvents()
         assert window.density == density
         assert window.tree.visualItemRect(window.items[1]).height() == DENSITY_HEIGHTS[density]
@@ -755,7 +869,8 @@ def test_layout_density_changes_rows_without_changing_plan(app, tmp_path):
         y = window.tree.header().height() + rect.center().y()
         assert image.pixelColor(x, y) == QColor("#72a9e0")
     reopened = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
-    assert reopened.density == "dense" and reopened.density_selector.currentData() == "dense"
+    assert reopened.density == "dense"
+    assert SettingsDialog(reopened.plan, density=reopened.density).density_selector.currentData() == "dense"
     window.close()
 
 
@@ -764,7 +879,7 @@ def test_unknown_saved_density_falls_back_to_comfortable(app, tmp_path):
     preferences.setValue(DENSITY_PREFERENCE_KEY, "unknown")
     window = MainWindow(preferences)
     assert window.density == "comfortable"
-    assert window.density_selector.currentData() == "comfortable"
+    assert SettingsDialog(window.plan, density=window.density).density_selector.currentData() == "comfortable"
 
 
 def test_existing_density_preference_is_preserved(app, tmp_path):
@@ -772,18 +887,18 @@ def test_existing_density_preference_is_preserved(app, tmp_path):
     preferences.setValue("display/density", "comfortable")
     window = MainWindow(preferences)
     assert window.density == "comfortable"
-    assert window.density_selector.currentData() == "comfortable"
+    assert SettingsDialog(window.plan, density=window.density).density_selector.currentData() == "comfortable"
 
 
 @pytest.mark.parametrize("previous,expected", [("comfortable", "comfortable"), ("tight", "comfortable"), ("dense", "tight")])
-def test_old_density_preferences_keep_spacing_where_possible(app, tmp_path, previous, expected):
+def test_old_density_preferences_keep_spacing_where_possible(app, tmp_path, previous, expected, monkeypatch):
     path = str(tmp_path / "density.ini")
     preferences = QSettings(path, QSettings.Format.IniFormat)
     preferences.setValue("display/density", previous)
     window = MainWindow(preferences)
     assert window.density == expected
     assert not preferences.contains(DENSITY_PREFERENCE_KEY)
-    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
+    set_density_in_settings(window, "dense", monkeypatch)
     assert preferences.value("display/density") == previous
     assert preferences.value(DENSITY_PREFERENCE_KEY) == "dense"
     reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
@@ -807,11 +922,11 @@ def test_preference_write_failure_is_reported(app, monkeypatch):
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
     window = MainWindow(FailingPreferences())
-    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
+    set_density_in_settings(window, "dense", monkeypatch)
     assert warnings and "/unwritable/preferences" in warnings[-1]
 
 
-def test_density_switch_commits_active_cell_edit(app, tmp_path):
+def test_settings_density_switch_commits_active_cell_edit(app, tmp_path):
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     window.plan = Plan(tasks=[Task(1, "Original")])
     window.reset_history(saved=True)
@@ -825,8 +940,13 @@ def test_density_switch_commits_active_cell_edit(app, tmp_path):
     assert editor is not None
     editor.selectAll()
     QTest.keyClicks(editor, "Changed")
-    window.density_selector.setFocus()
-    window.density_selector.setCurrentIndex(window.density_selector.findData("dense"))
+    def choose_density():
+        dialog = QApplication.activeModalWidget()
+        assert isinstance(dialog, SettingsDialog)
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        dialog.accept()
+    QTimer.singleShot(0, choose_density)
+    window.settings()
     app.processEvents()
     app.processEvents()
     assert window.plan.tasks[0].name == "Changed" and window.dirty
