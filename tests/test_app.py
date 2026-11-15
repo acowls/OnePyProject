@@ -466,7 +466,7 @@ def test_toolbar_actions_are_icon_only_with_accessible_names(app, tmp_path):
     assert window.control_tabs.currentIndex() == 1
     assert [action.text() for action in file_actions] == ["New", "Open", "Save", "Save As", "Import", "Export"]
     assert [action.text() for action in task_actions] == [
-        "Settings", "Resources", "Assign", "+ Task", "Edit", "Delete", "Undo", "Redo", "Link", "Unlink", "Indent", "Outdent"]
+        "Settings", "Resources", "Assign", "+ Task", "Edit", "Delete", "Cut", "Copy", "Paste", "Undo", "Redo", "Link", "Unlink", "Indent", "Outdent"]
     assert all(not action.icon().isNull() for action in file_actions + task_actions)
     for toolbar, actions in ((window.file_toolbar, file_actions), (window.task_toolbar, task_actions)):
         assert toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly

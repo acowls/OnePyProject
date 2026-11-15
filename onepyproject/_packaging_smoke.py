@@ -23,6 +23,7 @@ from .report_pdf import export_pdf
 from .ai.diff import compare_plans
 from .ai.proposals import FIELDS, apply_operations, make_snapshot
 from .ai.provider import CredentialStore, normalize_config, request_proposal
+from .clipboard import release_rows
 
 
 def run():
@@ -38,7 +39,8 @@ def run():
             image.pixelColor(x, y).alpha() for x in range(image.width()) for y in range(image.height())
         ):
             raise RuntimeError(f"SVG icon failed to render: {filename}")
-    for filename in ("tree_open.svg", "tree_closed.svg", "ai_shield.svg", "ai_clear.svg", "ai_play.svg", "ai_stop.svg"):
+    for filename in ("tree_open.svg", "tree_closed.svg", "ai_shield.svg", "ai_clear.svg", "ai_play.svg", "ai_stop.svg",
+                     "cut.svg", "copy.svg", "paste.svg"):
         image = QImage(str(ASSET_DIR.parent / "ui" / filename))
         if image.isNull():
             raise RuntimeError(f"SVG image failed to load: {filename}")
@@ -162,6 +164,16 @@ def run():
         app.processEvents()
         if next(task for task in window.plan.tasks if task.uid == 20).mode != "work":
             raise RuntimeError("Mode selection did not update the task")
+        # The offscreen clipboard is private to this process; do not overwrite
+        # the user's real clipboard during a native packaged smoke test.
+        if app.platformName() == "offscreen":
+            window.tree.setCurrentItem(window.items[30], 1)
+            window.copy_rows()
+            window.paste_rows()
+            if window.plan.tasks[-1].name != "After" or window.plan.tasks[-1].predecessors != [20]:
+                raise RuntimeError("Row copy and paste failed")
+            window.undo()
+            release_rows()
         window.tree.setColumnWidth(1, 315)
         def choose_density():
             dialog = QApplication.activeModalWidget()

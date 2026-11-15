@@ -29,6 +29,7 @@ from .report import export_html
 from .report_pdf import export_pdf
 from .ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY, read_density_preference
 from .preferences import application_preferences
+from .clipboard import clear_cut, get_rows, paste_rows, put_rows, release_rows
 from .ai.proposals import ProposalError, plan_revision
 from .ai.preview import CHANGED_CELL, ROW_COLORS, build_preview
 from .ai.ui import AIAssistantDock
@@ -86,6 +87,12 @@ class TaskTree(QTreeWidget):
                 bar.setValue(bar.value() + (-delta if key in (Qt.Key.Key_Up, Qt.Key.Key_PageUp) else delta))
             return True
         if event.type() == QEvent.Type.KeyPress and self.state() != QAbstractItemView.State.EditingState:
+            for shortcut, handler in ((QKeySequence.StandardKey.Cut, self.window.cut_rows),
+                                      (QKeySequence.StandardKey.Copy, self.window.copy_rows),
+                                      (QKeySequence.StandardKey.Paste, self.window.paste_rows)):
+                if event.matches(shortcut):
+                    handler()
+                    return True
             key = event.key()
             modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
             if (self.window.digit_edits_duration and modifiers in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier)
@@ -813,13 +820,21 @@ class MainWindow(QMainWindow):
                         ("Import", self.open_mpp, "import"), ("Export", self.export_project, "export"))
         task_actions = (("Settings", self.settings, "settings"), ("Resources", self.manage_resources, "resources"),
                         ("Assign", self.assign_resources, "assign"), ("+ Task", self.add_task, "task"), ("Edit", self.edit_task, "edit"),
-                        ("Delete", self.delete_task, "delete"), ("Undo", self.undo, "undo"),
+                        ("Delete", self.delete_task, "delete"), ("Cut", self.cut_rows, "cut"),
+                        ("Copy", self.copy_rows, "copy"), ("Paste", self.paste_rows, "paste"), ("Undo", self.undo, "undo"),
                         ("Redo", self.redo, "redo"), ("Link", self.link_tasks, "link"),
                         ("Unlink", self.unlink_tasks, "unlink"), ("Indent", self.indent_task, "indent"),
                         ("Outdent", self.outdent_task, "outdent"))
         for toolbar, entries in ((self.file_toolbar, file_actions), (self.task_toolbar, task_actions)):
             for title, handler, icon in entries:
-                action = QAction(toolbar_icon(icon), title, self)
+                if icon in ("cut", "copy", "paste"):
+                    action = QAction(QIcon(str(Path(__file__).resolve().parent / "assets" / "ui" / f"{icon}.svg")), title, self)
+                    setattr(self, f"{icon}_action", action)
+                    action.setShortcuts({"cut": QKeySequence.StandardKey.Cut, "copy": QKeySequence.StandardKey.Copy,
+                                         "paste": QKeySequence.StandardKey.Paste}[icon])
+                    action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+                else:
+                    action = QAction(toolbar_icon(icon), title, self)
                 if handler is not None:
                     action.triggered.connect(handler)
                 action.setToolTip(title)
@@ -889,6 +904,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
         self.tree = TaskTree(self)
+        for action in (self.cut_action, self.copy_action, self.paste_action):
+            self.tree.addAction(action)
         self.tree.setColumnCount(9)
         self.tree.setHeaderLabels(["ID", "Task", "Duration", "Start", "Finish", "Predecessors", "Resource", "Work", "Mode"])
         self.tree.setTreePosition(1)
@@ -939,8 +956,8 @@ class MainWindow(QMainWindow):
             QTabWidget::pane { border: 0; background: #f5f7fa; }
             QTabBar::tab { color: #425a70; background: #e4ebf1; padding: 6px 18px; }
             QTabBar::tab:selected { color: #17344c; background: #f5f7fa; font-weight: bold; }
-            QToolBar { spacing: 5px; padding: 7px; background: #f5f7fa; border: 0; }
-            QToolButton { padding: 6px 9px; border-radius: 4px; color: #24354a; }
+            QToolBar { spacing: 3px; padding: 7px; background: #f5f7fa; border: 0; }
+            QToolButton { padding: 6px 5px; border-radius: 4px; color: #24354a; }
             QToolButton:hover { background: #dfeaf6; }
             QStatusBar { background: #253444; color: #f3f7fb; }
             QStatusBar::item { border: 0; }
@@ -1032,6 +1049,35 @@ class MainWindow(QMainWindow):
     def selected_uids(self):
         selected = {item.data(0, Qt.ItemDataRole.UserRole) for item in self.tree.selectedItems()}
         return [task.uid for task in self.plan.tasks if task.uid in selected]
+
+    def copy_rows(self):
+        if self.ai_preview is None and put_rows(self, self.selected_uids()):
+            self.statusBar().showMessage("Rows copied. Paste after a selected task or at the end.", 5000)
+
+    def cut_rows(self):
+        if self.ai_preview is None and put_rows(self, self.selected_uids(), cut=True):
+            self.statusBar().showMessage("Rows ready to move. Choose a destination and paste; the originals remain until then.", 7000)
+
+    def paste_rows(self):
+        if self.ai_preview is not None:
+            return
+        rows = get_rows()
+        if rows is None:
+            self.statusBar().showMessage("No OnePyProject rows are available to paste.", 5000)
+            return
+        selected = self.selected_uids()
+        anchor = selected[-1] if selected else None
+        try:
+            candidate, pasted, dropped = paste_rows(self, rows, anchor)
+        except (ValueError, KeyError, OverflowError, RecursionError) as exc:
+            QMessageBox.warning(self, "Cannot paste rows", str(exc))
+            return
+        def apply():
+            self.plan.tasks = candidate.tasks
+            self.plan.resources = candidate.resources
+        if self.mutate(apply, pasted):
+            clear_cut(rows)
+            self.statusBar().showMessage(f"Rows pasted.{f' {dropped} unsupported predecessor link(s) omitted.' if dropped else ''}", 7000)
 
     def refresh(self, selected=None):
         expanded = {uid for uid, item in self.items.items() if item.isExpanded()}
@@ -1598,6 +1644,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.aboutToQuit.connect(release_rows)
     app.setApplicationName("OnePyProject")
     app.setApplicationVersion(__version__)
     window = MainWindow()
