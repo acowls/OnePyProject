@@ -627,11 +627,7 @@ class ExportDialog(QFileDialog):
             self.filename_edit.clear()
             return
         selected = self.selected_format()
-        files = self.selectedFiles()
-        if not files:
-            QMessageBox.warning(self, "Cannot export", "Enter a file name.")
-            return
-        target = Path(files[0])
+        target = typed_path
         if target.suffix.lower() == f".{selected}":
             pass
         elif target.suffix.lower() in (".mpp", ".html", ".pdf"):
@@ -660,8 +656,10 @@ class ExportDialog(QFileDialog):
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
-        self.selectFile(str(target))
-        super().accept()
+        # The filename edit and current directory are the source of truth. The
+        # QFileDialog selection model may not be populated yet in offscreen or
+        # freshly-opened dialogs, so do not let it veto a validated target.
+        QDialog.accept(self)
         if self.result() == QDialog.DialogCode.Accepted:
             self.output_path = target
             self.template_path = template

@@ -239,6 +239,14 @@ def test_destination_extension_matches_selected_format(app, tmp_path, filename, 
     assert dialog.output_path == tmp_path / expected
 
 
+def test_export_uses_filename_even_before_file_dialog_selection_model_updates(app, tmp_path, monkeypatch):
+    dialog = ExportDialog(initial_format="pdf", initial_path=tmp_path / "chosen.pdf")
+    monkeypatch.setattr(dialog, "selectedFiles", lambda: [])
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.output_path == tmp_path / "chosen.pdf"
+
+
 def test_destination_requires_a_filename(app, tmp_path):
     dialog = ExportDialog(initial_format="html")
     dialog.setDirectory(str(tmp_path))
