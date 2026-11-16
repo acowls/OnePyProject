@@ -153,10 +153,11 @@ def run():
         app.processEvents()
         dialog.accept()
         expected_export = directory / "chosen.pdf"
-        if dialog.output_path != expected_export:
+        actual_export = dialog.output_path
+        if actual_export is None or actual_export.resolve() != expected_export.resolve():
             raise RuntimeError(
                 "Export dialog did not accept the selected file: "
-                f"result={dialog.result()}, output={dialog.output_path!r}, "
+                f"result={dialog.result()}, output={actual_export!r}, "
                 f"expected={expected_export!r}, directory={dialog.directory().absolutePath()!r}, "
                 f"filename={dialog.filename_edit.text()!r}"
             )
