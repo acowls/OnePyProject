@@ -149,9 +149,17 @@ def run():
         dialog = ExportDialog(window, initial_format="pdf", initial_path=directory / "chosen.pdf")
         if dialog.show_time.isChecked() or dialog.paper.currentData() != "A4":
             raise RuntimeError("Export dialog defaults are incorrect")
+        dialog.show()
+        app.processEvents()
         dialog.accept()
-        if dialog.output_path != directory / "chosen.pdf":
-            raise RuntimeError("Export dialog did not accept the selected file")
+        expected_export = directory / "chosen.pdf"
+        if dialog.output_path != expected_export:
+            raise RuntimeError(
+                "Export dialog did not accept the selected file: "
+                f"result={dialog.result()}, output={dialog.output_path!r}, "
+                f"expected={expected_export!r}, directory={dialog.directory().absolutePath()!r}, "
+                f"filename={dialog.filename_edit.text()!r}"
+            )
         settings = SettingsDialog(plan, window)
         if settings.title.minimumWidth() < 400 or display_time(datetime(2026, 11, 11, 8), "short") != "11 Nov 08:00":
             raise RuntimeError("Settings or short date display is incorrect")
