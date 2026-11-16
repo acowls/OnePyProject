@@ -160,9 +160,10 @@ def test_copy_preserves_meaningful_external_predecessors_for_repeated_paste(wind
 def test_standard_shortcuts_work_for_rows_but_not_intercept_text_edit(window, app):
     select(window, 20)
     window.tree.setFocus()
-    for action, key in ((window.copy_action, Qt.Key.Key_C), (window.paste_action, Qt.Key.Key_V)):
-        assert action.shortcut() == QKeySequence(QKeySequence.StandardKey.Copy if key == Qt.Key.Key_C else QKeySequence.StandardKey.Paste)
-        QTest.keyClick(window.tree, key, Qt.KeyboardModifier.ControlModifier)
+    for action, standard_key in ((window.copy_action, QKeySequence.StandardKey.Copy),
+                                 (window.paste_action, QKeySequence.StandardKey.Paste)):
+        assert action.shortcut() == QKeySequence(standard_key)
+        QTest.keySequence(window.tree.viewport(), QKeySequence(standard_key))
         app.processEvents()
     assert len(window.plan.tasks) == 5
     window.tree.setCurrentItem(window.items[20], 1)
@@ -170,7 +171,7 @@ def test_standard_shortcuts_work_for_rows_but_not_intercept_text_edit(window, ap
     app.processEvents()
     editor = next(item for item in window.tree.findChildren(QLineEdit) if item.isVisible())
     editor.selectAll()
-    QTest.keyClick(editor, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    QTest.keySequence(editor, QKeySequence(QKeySequence.StandardKey.Copy))
     assert app.clipboard().text() == "Design"
     QTest.keyClick(editor, Qt.Key.Key_Escape)
 
@@ -178,10 +179,10 @@ def test_standard_shortcuts_work_for_rows_but_not_intercept_text_edit(window, ap
 def test_cut_and_paste_shortcuts_move_as_one_action(window, app):
     select(window, 10)
     window.tree.setFocus()
-    QTest.keyClick(window.tree, Qt.Key.Key_X, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(window.tree.viewport(), Qt.Key.Key_X, Qt.KeyboardModifier.ControlModifier)
     assert len(window.plan.tasks) == 4 and not window.dirty
     select(window, 40)
-    QTest.keyClick(window.tree, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(window.tree.viewport(), Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
     assert [task.uid for task in window.plan.tasks] == [40, 10, 20, 30]
     window.undo()
     assert [task.uid for task in window.plan.tasks] == [10, 20, 30, 40]

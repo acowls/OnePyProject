@@ -37,7 +37,7 @@ from .ai.ui import AIAssistantDock
 
 DATE_FORMATS = ("system", "short", "long")
 MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-EMPTY_ROW_HINT = "Double-click or press Enter to add a task, Shift+Enter to insert"
+EMPTY_ROW_HINT = "Double-click / Enter: add · Shift+Enter: insert"
 TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors", "resource", "work", "mode")
 COLUMN_WIDTH_KEY = "display/task_column_widths"
 
@@ -568,7 +568,10 @@ class ExportDialog(QFileDialog):
         grid.addWidget(button_box, 5, 0, 1, 3)
         self.set_format(initial_format)
         if initial_path:
-            self.selectFile(str(initial_path))
+            initial_path = Path(initial_path).expanduser()
+            self.setDirectory(str(initial_path.parent))
+            self.selectFile(initial_path.name)
+            self.filename_edit.setText(initial_path.name)
         self.update_options()
 
     def selected_format(self):
@@ -584,7 +587,12 @@ class ExportDialog(QFileDialog):
         if self._last_format and selected != self._last_format:
             name = self.filename_edit.text().strip()
             if name and Path(name).suffix.lower() in (".mpp", ".html", ".pdf"):
-                self.filename_edit.setText(str(Path(name).with_suffix(f".{selected}")))
+                target = Path(name).expanduser().with_suffix(f".{selected}")
+                if target.is_absolute():
+                    self.setDirectory(str(target.parent))
+                    self.filename_edit.setText(target.name)
+                else:
+                    self.filename_edit.setText(str(target))
         self._last_format = selected
         self.setDefaultSuffix(selected)
         self.mpp_warning.setVisible(selected == "mpp")
@@ -872,21 +880,13 @@ class MainWindow(QMainWindow):
                         ("Import", self.open_mpp, "import"), ("Export", self.export_project, "export"))
         task_actions = (("Settings", self.settings, "settings"), ("Resources", self.manage_resources, "resources"),
                         ("Assign", self.assign_resources, "assign"), ("+ Task", self.add_task, "task"), ("Edit", self.edit_task, "edit"),
-                        ("Delete", self.delete_task, "delete"), ("Cut", self.cut_rows, "cut"),
-                        ("Copy", self.copy_rows, "copy"), ("Paste", self.paste_rows, "paste"), ("Undo", self.undo, "undo"),
+                        ("Delete", self.delete_task, "delete"), ("Undo", self.undo, "undo"),
                         ("Redo", self.redo, "redo"), ("Link", self.link_tasks, "link"),
                         ("Unlink", self.unlink_tasks, "unlink"), ("Indent", self.indent_task, "indent"),
                         ("Outdent", self.outdent_task, "outdent"))
         for toolbar, entries in ((self.file_toolbar, file_actions), (self.task_toolbar, task_actions)):
             for title, handler, icon in entries:
-                if icon in ("cut", "copy", "paste"):
-                    action = QAction(QIcon(str(Path(__file__).resolve().parent / "assets" / "ui" / f"{icon}.svg")), title, self)
-                    setattr(self, f"{icon}_action", action)
-                    action.setShortcuts({"cut": QKeySequence.StandardKey.Cut, "copy": QKeySequence.StandardKey.Copy,
-                                         "paste": QKeySequence.StandardKey.Paste}[icon])
-                    action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
-                else:
-                    action = QAction(toolbar_icon(icon), title, self)
+                action = QAction(toolbar_icon(icon), title, self)
                 if handler is not None:
                     action.triggered.connect(handler)
                 action.setToolTip(title)
@@ -956,8 +956,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
         self.tree = TaskTree(self)
-        for action in (self.cut_action, self.copy_action, self.paste_action):
-            self.tree.addAction(action)
+        self.cut_action = QAction(QIcon(str(Path(__file__).resolve().parent / "assets" / "ui" / "cut.svg")), "Cut", self)
+        self.copy_action = QAction(QIcon(str(Path(__file__).resolve().parent / "assets" / "ui" / "copy.svg")), "Copy", self)
+        self.paste_action = QAction(QIcon(str(Path(__file__).resolve().parent / "assets" / "ui" / "paste.svg")), "Paste", self)
+        for action, shortcut in ((self.cut_action, QKeySequence.StandardKey.Cut),
+                                 (self.copy_action, QKeySequence.StandardKey.Copy),
+                                 (self.paste_action, QKeySequence.StandardKey.Paste)):
+            action.setShortcuts(shortcut)
+            action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            self.tree.viewport().addAction(action)
         self.tree.setColumnCount(9)
         self.tree.setHeaderLabels(["ID", "Task", "Duration", "Start", "Finish", "Predecessors", "Resource", "Work", "Mode"])
         self.tree.setTreePosition(1)
@@ -1056,11 +1063,25 @@ class MainWindow(QMainWindow):
             self.preferences.setValue(f"{COLUMN_WIDTH_KEY}/{TASK_COLUMN_KEYS[index]}", new_width)
             self._column_width_sync.start()
 
+    def save_column_widths(self):
+        for index, key in enumerate(TASK_COLUMN_KEYS):
+            self.preferences.setValue(f"{COLUMN_WIDTH_KEY}/{key}", self.tree.columnWidth(index))
+
     def apply_toolbar_labels(self):
         style = (Qt.ToolButtonStyle.ToolButtonTextUnderIcon if self.show_icon_labels
                  else Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.file_toolbar.setToolButtonStyle(style)
         self.task_toolbar.setToolButtonStyle(style)
+        if self.show_icon_labels:
+            self.file_toolbar.setIconSize(QSize(16, 16))
+            self.task_toolbar.setIconSize(QSize(16, 16))
+            self.file_toolbar.setStyleSheet("QToolButton { padding: 2px 2px; font-size: 9px; }")
+            self.task_toolbar.setStyleSheet("QToolButton { padding: 2px 2px; font-size: 9px; }")
+        else:
+            self.file_toolbar.setIconSize(QSize(20, 20))
+            self.task_toolbar.setIconSize(QSize(20, 20))
+            self.file_toolbar.setStyleSheet("")
+            self.task_toolbar.setStyleSheet("")
 
     def sync_preferences(self):
         self.preferences.sync()
@@ -1528,7 +1549,8 @@ class MainWindow(QMainWindow):
                 self._ai_dialog.close()
             if self._column_width_sync.isActive():
                 self._column_width_sync.stop()
-                self.sync_preferences()
+            self.save_column_widths()
+            self.sync_preferences()
             event.accept()
         else:
             event.ignore()
