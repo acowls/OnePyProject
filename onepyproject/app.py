@@ -37,7 +37,7 @@ from .ai.ui import AIAssistantDock
 
 DATE_FORMATS = ("system", "short", "long")
 MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-EMPTY_ROW_HINT = "Double-click / Enter: add · Shift+Enter: insert"
+EMPTY_ROW_HINT = "Enter/dbl-click adds; Shift+Enter inserts"
 TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors", "resource", "work", "mode")
 COLUMN_WIDTH_KEY = "display/task_column_widths"
 
