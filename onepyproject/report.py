@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import Callable
 
-from .model import Plan, estimated_tasks, schedule
+from .model import Plan, completion_percentages, estimated_tasks, schedule
 from .dependencies import remap_predecessors, task_numbers
 from .resources import format_task_resources
 
@@ -28,6 +28,7 @@ class ReportRow:
     work: str
     mode: str
     summary: bool
+    percent_complete: str
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class Report:
 def make_report(plan: Plan) -> Report:
     """Calculate a snapshot without changing the working plan."""
     calculated = schedule(plan)
+    progress = completion_percentages(plan, calculated)
     estimated = estimated_tasks(plan)
     numbers = task_numbers(plan.tasks)
     depths = {}
@@ -57,7 +59,7 @@ def make_report(plan: Plan) -> Report:
             predecessors=", ".join(map(str, remap_predecessors(task.predecessors, numbers))),
             resources=format_task_resources(plan, task),
             work=f"{item.work:g} h", mode="Work" if task.mode == "work" else "Duration",
-            summary=item.summary,
+            summary=item.summary, percent_complete=f"{progress[task.uid]:.1f}%",
         ))
     return Report(plan.title, plan.start, tuple(rows),
                   min((row.start for row in rows), default=None),
@@ -124,7 +126,7 @@ def html_report(report: Report, show_time: bool = False) -> str:
     rows = []
     for row in report.rows:
         values = (str(row.uid), row.duration, format_report_time(row.start, show_time), format_report_time(row.finish, show_time),
-                  row.predecessors, row.resources, row.work, row.mode)
+                  row.predecessors, row.resources, row.work, row.mode, row.percent_complete)
         indent = min(row.depth, 20) * 16
         task_label = escape(row.name)
         parent_label = f'<span class="parent">Parent: {row.parent}</span>' if row.parent else ''
@@ -137,7 +139,7 @@ def html_report(report: Report, show_time: bool = False) -> str:
             + ''.join(f'<td>{escape(value)}</td>' for value in values[4:])
             + '</tr>'
         )
-    body = '\n'.join(rows) if rows else '<tr><td colspan="10" class="empty">No tasks in this project.</td></tr>'
+    body = '\n'.join(rows) if rows else '<tr><td colspan="11" class="empty">No tasks in this project.</td></tr>'
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} — OnePyProject</title>
@@ -150,7 +152,7 @@ th{{background:#edf3f7;color:#304d65;font-size:12px;white-space:nowrap}} tr:nth-
 th:nth-child(1){{min-width:35px}} th:nth-child(2){{min-width:200px}} th:nth-child(3){{min-width:72px}}
 th:nth-child(4),th:nth-child(5){{min-width:120px}} th:nth-child(6){{min-width:350px}}
 th:nth-child(7){{min-width:105px}} th:nth-child(8){{min-width:135px}}
-th:nth-child(9){{min-width:50px}} th:nth-child(10){{min-width:80px}}
+th:nth-child(9){{min-width:50px}} th:nth-child(10){{min-width:80px}} th:nth-child(11){{min-width:80px}}
 .summary td{{font-weight:600}} .name{{min-width:200px;white-space:pre-wrap}}
 .parent{{display:block;color:#6a7d8b;font-size:11px;font-weight:normal}} .timeline{{width:28%;min-width:350px}}
 .gantt-plot{{position:relative}} svg{{display:block;width:100%;height:24px}} .grid{{stroke:#e2e8ef;stroke-width:1}}
@@ -160,7 +162,7 @@ th:nth-child(9){{min-width:50px}} th:nth-child(10){{min-width:80px}}
 </style></head><body>
 <h1>{title}</h1><p>Project start: {escape(report.project_start)} · Read-only schedule snapshot</p>
 <p>Dates and times are local. ? indicates an estimate. Dependencies are listed, not drawn. Scroll horizontally to see all columns.</p>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Task</th><th>Duration</th><th>Start</th><th>Finish</th><th>Gantt<br>{escape(range_label)}</th><th>Predecessors</th><th>Resources</th><th>Work</th><th>Mode</th></tr></thead>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Task</th><th>Duration</th><th>Start</th><th>Finish</th><th>Gantt<br>{escape(range_label)}</th><th>Predecessors</th><th>Resources</th><th>Work</th><th>Mode</th><th>Complete</th></tr></thead>
 <tbody>{body}</tbody></table></div></body></html>\n'''
 
 

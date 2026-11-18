@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 
 from .dependencies import lag_minutes, parse_dependency, task_numbers
@@ -41,6 +42,8 @@ class Task:
     predecessors: list[int | str] = field(default_factory=list)
     estimated: bool = False
     assignments: list[ResourceAssignment] = field(default_factory=list)
+    percent_complete: float = 0.0
+    summary_color: str = ""
 
 
 @dataclass
@@ -78,7 +81,7 @@ def save_plan(plan: Plan, path: str | Path) -> None:
     schedule(snapshot)
     target = Path(path)
     # Keep the established file identifier so existing .pxplan files remain compatible.
-    payload = json.dumps({"format": "projectx-plan", "version": 2,
+    payload = json.dumps({"format": "projectx-plan", "version": 3,
                           "plan": asdict(snapshot)}, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=".onepyproject-", suffix=".pxplan", dir=target.parent)
     try:
@@ -92,7 +95,7 @@ def save_plan(plan: Plan, path: str | Path) -> None:
 
 def load_plan(path: str | Path) -> Plan:
     obj = json.loads(Path(path).read_text(encoding="utf-8"))
-    if obj.get("format") != "projectx-plan" or obj.get("version") not in (1, 2):
+    if obj.get("format") != "projectx-plan" or obj.get("version") not in (1, 2, 3):
         raise ValueError("Not a supported OnePyProject plan")
     data = obj["plan"]
     tasks = []
@@ -235,6 +238,13 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
             raise ValueError(f"Task {number}: invalid scheduling mode")
         if not all(math.isfinite(x) for x in (task.duration, task.work, task.units)):
             raise ValueError(f"Task {number}: numbers must be finite")
+        if not math.isfinite(task.percent_complete) or not 0 <= task.percent_complete <= 100:
+            raise ValueError(f"Task {number}: percent complete must be between 0 and 100")
+        if task.summary_color and not re.fullmatch(r"#[0-9A-Fa-f]{6}", task.summary_color):
+            raise ValueError(f"Task {number}: summary color must be a six-digit hex color")
+        if (not math.isfinite(task.percent_complete) or
+                not 0 <= task.percent_complete <= 100):
+            raise ValueError(f"Task {number}: percent complete must be between 0 and 100")
         if task.duration < 0 or task.work < 0 or task.units <= 0:
             raise ValueError(f"Task {number}: duration and work must be non-negative and allocation positive")
         if task.assignments and task.resource.strip():
@@ -332,6 +342,27 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
 
     for task in plan.tasks:
         calculate(task.uid)
+    return result
+
+
+def completion_percentages(plan: Plan, calculated: dict[int, Scheduled] | None = None) -> dict[int, float]:
+    """Leaf progress is user-entered; summaries roll up by scheduled work."""
+    calculated = calculated if calculated is not None else schedule(plan)
+    children: dict[int, list[int]] = {}
+    for task in plan.tasks:
+        if task.parent:
+            children.setdefault(task.parent, []).append(task.uid)
+    result: dict[int, float] = {}
+    for task in reversed(plan.tasks):
+        child_ids = children.get(task.uid, [])
+        if not child_ids:
+            result[task.uid] = float(task.percent_complete)
+            continue
+        weights = [calculated[uid].work if calculated[uid].work > 0
+                   else max(calculated[uid].duration, 1.0) for uid in child_ids]
+        total = sum(weights)
+        result[task.uid] = (sum(result[uid] * weight for uid, weight in zip(child_ids, weights)) / total
+                            if total else 0.0)
     return result
 
 

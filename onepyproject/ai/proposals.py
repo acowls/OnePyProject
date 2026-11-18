@@ -10,7 +10,7 @@ import math
 import re
 
 from ..dependencies import Dependency, format_dependency, parse_dependency, task_numbers
-from ..model import Plan, Resource, ResourceAssignment, Task, descendants, schedule
+from ..model import Plan, Resource, ResourceAssignment, Task, completion_percentages, descendants, schedule
 from ..resources import migrate_legacy_resources, overallocation_warnings
 
 
@@ -87,6 +87,7 @@ def plan_revision(plan: Plan) -> str:
 def make_snapshot(plan: Plan) -> Snapshot:
     baseline = copy.deepcopy(plan)
     calculated = schedule(baseline)
+    progress = completion_percentages(baseline, calculated)
     revision = plan_revision(baseline)
     numbers = task_numbers(baseline.tasks)
     rows = []
@@ -97,12 +98,15 @@ def make_snapshot(plan: Plan) -> Snapshot:
             "parent": f"task:{task.parent}" if task.parent else None,
             "duration_days": task.duration, "earliest_date": task.earliest or None,
             "mode": task.mode, "work_hours": task.work, "estimated": task.estimated,
+            "percent_complete": task.percent_complete,
+            "collapsed_summary_color": task.summary_color or None,
             "assignments": [{"resource": f"resource:{a.resource_uid}", "units_percent": a.units} for a in task.assignments],
             "legacy_resource": task.resource or None, "legacy_units_percent": task.units if task.resource else None,
             "predecessors": [{"task": f"task:{link.uid}", "kind": link.kind, "lag": link.lag, "unit": link.unit}
                              for link in map(parse_dependency, task.predecessors)],
             "calculated": {"start": item.start.isoformat(), "finish": item.finish.isoformat(),
-                           "duration_days": item.duration, "work_hours": item.work, "summary": item.summary},
+                           "duration_days": item.duration, "work_hours": item.work, "summary": item.summary,
+                           "percent_complete": progress[task.uid]},
         })
     normalized = copy.deepcopy(baseline)
     migrate_legacy_resources(normalized)

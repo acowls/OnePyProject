@@ -84,6 +84,26 @@ def test_estimated_duration_mpp_roundtrip(tmp_path):
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_percent_complete_mpp_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase"),
+        Task(2, "Partial", parent=1, duration=2, percent_complete=35),
+        Task(3, "Complete", parent=1, duration=1, percent_complete=100)])
+    output = tmp_path / "progress.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [task.percent_complete for task in imported.tasks] == [57, 35, 100]
+    assert not notes
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_custom_summary_color_is_reported_as_not_supported_in_mpp(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase", summary_color="#f08040"),
+                                            Task(2, "Child", parent=1)])
+    notes = export_mpp(plan, TEMPLATE, tmp_path / "custom-color.mpp")
+    assert notes == ["Task 1: custom collapsed-summary color is not preserved in MPP"]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
 def test_mpp_multiple_resources_and_unassigned_resource_roundtrip(tmp_path):
     plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada", 75), Resource(2, "Ben", 150), Resource(7, "Unassigned", 0)], tasks=[
         Task(1, "Team task", duration=3,

@@ -16,7 +16,7 @@ from pymppwriter import Resource as MppResource
 from pymppwriter import Task as MppTask
 from pymppwriter import read_project
 
-from .model import Plan, Resource, ResourceAssignment, Task, estimated_tasks, schedule
+from .model import Plan, Resource, ResourceAssignment, Task, completion_percentages, estimated_tasks, schedule
 from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency, task_numbers
 from .resources import migrate_legacy_resources
 from .mpp_template import strip_template_resources
@@ -25,7 +25,7 @@ from .mpp_template import strip_template_resources
 IMPORT_WARNING = (
     "MPP import is experimental and lossy. The reader can skip unscheduled tasks and "
     "does not reliably read calendars, task types or all Project fields. This app "
-    "recalculates using its own limited scheduler. Costs, custom fields, progress, "
+    "recalculates using its own limited scheduler. Costs, custom fields, "
     "baselines, resource calendars, rates, timephased work, some lag units and other data may be lost. "
     "Keep the original MPP and verify the imported schedule."
 )
@@ -196,7 +196,8 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         tasks.append(Task(uid=task.uid, name=task.name or f"Task {numbers[task.uid]}", parent=task.parent_uid,
                           earliest=task.start.date().isoformat(), duration=max(0, task.duration_days),
                           mode=mode, work=hours if mode == "work" else 8.0,
-                          assignments=assns, predecessors=predecessors, estimated=task.estimated))
+                          assignments=assns, predecessors=predecessors, estimated=task.estimated,
+                          percent_complete=getattr(task, "percent_complete", 0) or 0))
     plan = Plan(title=source.title or "Imported project", start=source.start.date().isoformat(),
                 tasks=tasks, resources=resources)
     schedule(plan)  # Reject broken outlines or cycles rather than hiding them.
@@ -215,6 +216,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
     migrate_legacy_resources(plan)
     scheduled = schedule(plan)
     estimates = estimated_tasks(plan)
+    progress = completion_percentages(plan, scheduled)
     numbers = task_numbers(plan.tasks)
     by_uid = {task.uid: task for task in plan.tasks}
     resources = [MppResource(uid=resource.uid, name=resource.name, max_units=resource.max_units / 100)
@@ -230,6 +232,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
         out_tasks.append(MppTask(uid=task.uid, name=task.name, start=item.start, finish=item.finish,
                                  duration_days=item.duration, outline_level=level, parent_uid=task.parent,
                                  estimated=estimates[task.uid],
+                                 percent_complete=round(progress[task.uid]),
                                  task_type="fixed_work" if task.mode == "work" else "fixed_duration",
                                  effort_driven=task.mode == "work"))
         if item.summary and task.assignments:
@@ -254,6 +257,8 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
     project = Project(title=plan.title, start=datetime.fromisoformat(plan.start + "T08:00"),
                       tasks=out_tasks, relations=relations, resources=resources,
                       assignments=assignments, calendar=calendar)
+    notes = [f"Task {numbers[task.uid]}: custom collapsed-summary color is not preserved in MPP"
+             for task in plan.tasks if task.summary_color]
     target.parent.mkdir(parents=False, exist_ok=True)
     # Publish with a no-overwrite hard link, even if another process creates the
     # destination between the existence check and the end of the write.
@@ -266,7 +271,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
             strip_template_resources(writer)
             writer.write(project, temporary)
         os.link(temporary, target)
-        return [str(item.message) for item in found]
+        return notes + [str(item.message) for item in found]
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

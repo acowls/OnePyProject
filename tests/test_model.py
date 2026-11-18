@@ -4,7 +4,7 @@ import json
 import pytest
 
 from onepyproject.dependencies import parse_dependency, parse_display_predecessors, parse_predecessors, remap_predecessors, task_numbers
-from onepyproject.model import Plan, Task, indent, load_plan, outdent, save_plan, schedule
+from onepyproject.model import Plan, Task, completion_percentages, indent, load_plan, outdent, save_plan, schedule
 
 
 def test_display_ids_remap_dependency_text_without_changing_precision():
@@ -70,10 +70,11 @@ def test_indent_outdent_preserves_preorder():
 
 
 def test_native_file_roundtrip(tmp_path):
-    p = Plan(title="Plan", start="2026-11-16", holidays=["2026-12-25"], tasks=[Task(4, "Work")])
+    p = Plan(title="Plan", start="2026-11-16", holidays=["2026-12-25"], tasks=[Task(4, "Work", percent_complete=42)])
     path = tmp_path / "plan.pxplan"
     save_plan(p, path)
     assert load_plan(path) == p
+    assert json.loads(path.read_text())["version"] == 3
 
 
 def test_old_native_plan_without_estimated_field_still_opens(tmp_path):
@@ -82,6 +83,21 @@ def test_old_native_plan_without_estimated_field_still_opens(tmp_path):
                                 "plan": {"title": "Old", "start": "2026-11-16",
                                          "tasks": [{"uid": 1, "name": "Task"}]}}))
     assert not load_plan(path).tasks[0].estimated
+    assert not load_plan(path).tasks[0].percent_complete
+
+
+def test_progress_validation_and_weighted_summary_rollup():
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Top"), Task(2, "Nested", parent=1),
+                 Task(3, "Short", parent=2, duration=1, percent_complete=100),
+                 Task(4, "Long", parent=2, duration=3, percent_complete=0),
+                 Task(5, "Gate", parent=1, duration=0, percent_complete=100)])
+    values = completion_percentages(plan)
+    assert values[2] == pytest.approx(25)
+    assert values[1] == pytest.approx(43.75)
+    for invalid in (-0.1, 100.1, float("nan")):
+        plan.tasks[1].percent_complete = invalid
+        with pytest.raises(ValueError, match="percent complete"):
+            schedule(plan)
 
 
 @pytest.mark.parametrize("value, kind, lag, unit", [

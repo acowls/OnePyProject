@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ..dependencies import remap_predecessors, task_numbers
-from ..model import Plan, Scheduled, schedule
+from ..model import Plan, Scheduled, completion_percentages, schedule
 from ..resources import format_task_resources, migrate_legacy_resources, overallocation_warnings
 
 
@@ -53,6 +53,8 @@ def _value(value) -> str:
 def compare_plans(before: Plan, after: Plan) -> PlanDiff:
     """Compare internal IDs, not displayed row numbers, including schedule ripple."""
     old_schedule, new_schedule = schedule(before), schedule(after)
+    old_progress = completion_percentages(before, old_schedule)
+    new_progress = completion_percentages(after, new_schedule)
     old_numbers, new_numbers = task_numbers(before.tasks), task_numbers(after.tasks)
     old_tasks, new_tasks = {t.uid: t for t in before.tasks}, {t.uid: t for t in after.tasks}
     old_resources, new_resources = {r.uid: r for r in before.resources}, {r.uid: r for r in after.resources}
@@ -101,7 +103,9 @@ def compare_plans(before: Plan, after: Plan) -> PlanDiff:
 
     fields = (("name", "Name"), ("parent", "Parent"), ("duration", "Duration days"),
               ("earliest", "Earliest start"), ("mode", "Mode"), ("work", "Work hours"),
-              ("estimated", "Estimated"), ("predecessors", "Predecessors"), ("assignments", "Assignments"),
+              ("estimated", "Estimated"), ("percent_complete", "Complete %"),
+              ("summary_color", "Collapsed summary color"),
+              ("predecessors", "Predecessors"), ("assignments", "Assignments"),
               ("resource", "Legacy resource"), ("units", "Legacy allocation %"))
     order_changed = ([task.uid for task in before.tasks if task.uid in new_tasks]
                      != [task.uid for task in after.tasks if task.uid in old_tasks])
@@ -115,15 +119,20 @@ def compare_plans(before: Plan, after: Plan) -> PlanDiff:
             for field, description in fields:
                 if field in ("name", "resource", "units"):
                     continue
+                if field == "percent_complete" and (new_schedule[uid] if new is not None else old_schedule[uid]).summary:
+                    continue
                 value = field_value(plan, numbers, task, field)
                 add("Direct", label, description, None if old is None else value, value if old is None else None)
             item = new_schedule[uid] if old is None else old_schedule[uid]
             for field, description in (("start", "Scheduled start"), ("finish", "Scheduled finish"),
-                                       ("duration", "Calculated duration days"), ("work", "Calculated work hours")):
-                value = getattr(item, field)
+                                       ("duration", "Calculated duration days"), ("work", "Calculated work hours"),
+                                       ("progress", "Calculated completion %")):
+                value = (old_progress[uid] if old is not None else new_progress[uid]) if field == "progress" else getattr(item, field)
                 add("Calculated", label, description, None if old is None else value, value if old is None else None)
             continue
         for field, description in fields:
+            if field == "percent_complete" and (old.parent or new.parent):
+                continue
             old_value, new_value = getattr(old, field), getattr(new, field)
             if old_value != new_value:
                 add("Direct", label, description, field_value(before, old_numbers, old, field),
@@ -134,8 +143,11 @@ def compare_plans(before: Plan, after: Plan) -> PlanDiff:
             add("Calculated", label, "Displayed ID", old_numbers[uid], new_numbers[uid])
         for field, description in (("start", "Scheduled start"), ("finish", "Scheduled finish"),
                                    ("duration", "Calculated duration days"), ("work", "Calculated work hours"),
-                                   ("summary", "Summary task")):
-            old_value, new_value = getattr(old_schedule[uid], field), getattr(new_schedule[uid], field)
+                                   ("summary", "Summary task"), ("progress", "Calculated completion %")):
+            if field == "progress" and not (old_schedule[uid].summary or new_schedule[uid].summary):
+                continue
+            old_value = old_progress[uid] if field == "progress" else getattr(old_schedule[uid], field)
+            new_value = new_progress[uid] if field == "progress" else getattr(new_schedule[uid], field)
             if old_value != new_value:
                 add("Calculated", label, description, old_value, new_value)
 

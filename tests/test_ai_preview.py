@@ -28,6 +28,16 @@ def test_preview_marks_direct_and_indirect_date_changes():
     assert rows[0].before.finish != rows[0].after.finish
 
 
+def test_preview_marks_leaf_and_rolled_up_progress_changes():
+    before = Plan(start="2026-11-16", tasks=[Task(1, "Phase"), Task(2, "Child", parent=1, duration=2)])
+    after = copy.deepcopy(before)
+    after.tasks[1].percent_complete = 50
+    rows = build_preview(before, after, display_time).rows
+    assert rows[0].status == rows[1].status == "changed"
+    assert 9 in rows[0].changed_columns and 9 in rows[1].changed_columns
+    assert rows[0].values[9] == rows[1].values[9] == "50.0%"
+
+
 def test_refinement_never_reuses_deleted_baseline_ids():
     before = Plan(start="2026-11-16", tasks=[Task(1, "Old")], resources=[Resource(1, "Old resource")])
     staged = Plan(start=before.start)

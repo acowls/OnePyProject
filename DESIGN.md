@@ -69,6 +69,7 @@ Alternatives considered: Aspose.Tasks can write MPP but was rejected because it 
 ### Calendar and task dates
 
 - The current project calendar is Monday–Friday, 08:00–12:00 and 13:00–17:00, with configurable whole-day holidays. A working day is 8 hours, week 5 days and month 20 days.
+- Leaf-task completion is a validated 0–100 percentage. Summary completion rolls up by child scheduled work, falling back to duration for unassigned tasks and to a unit weight for milestones. Optional task columns and automatic collapsed-summary coloring are user preferences; the 16-color name palette can be overridden on each summary. Custom colors apply only when a summary is collapsed; expanded summary brackets remain black. Gantt task bars show completion as a one-decimal dark progress overlay.
 - Schedules use local wall-clock values without timezone or daylight-saving conversions. Elapsed days, weeks and months are 24 hours, 7 days and 30 days respectively.
 - Leaf tasks are recalculated from project start, any entered earliest-start date, predecessors and the supported resource model. Summary start/finish roll up from children, summary work is summed, and summary duration is working time across the rolled-up span.
 - There is no automatic resource levelling, configurable working-week editor, individual task/resource calendar, time-varying allocation or resource-cost scheduling. Overallocations warn but do not move tasks.
@@ -87,13 +88,13 @@ Alternatives considered: Aspose.Tasks can write MPP but was rejected because it 
 - **Fixed work:** duration = work hours / (8 hours × sum of assignment units). At least one positively allocated resource is required. **Fixed duration:** work = duration in days × 8 hours × sum of assignment units. Percentages are converted to fractions for these calculations.
 - A resource's maximum units are used for overlap/overallocation warnings, not to cap work or automatically delay tasks. All assigned resources currently share the project calendar and have constant allocation over a task.
 - Resource assignments retained on imported summary tasks are not scheduled; MPP export refuses them until removed. OnePyProject also prevents indenting under an assigned task when that would create a new summary with an unscheduled assignment.
-- These rules are a simplified subset. Microsoft Project's fixed-units type, separate effort-driven behavior, progress/actual work, work contours, resource calendars and costs are not fully modelled.
+- These rules are a simplified subset. Microsoft Project's fixed-units type, separate effort-driven behavior, actual work, work contours, resource calendars and costs are not fully modelled.
 
 ## 6. MPP mapping and known fidelity risks
 
-- The supported subset maps task hierarchy, dates, durations, estimates, dependency types, working lags, resource names, maximum units and multiple positive-percentage assignments. Fixed-work data is read where it can be represented.
+- The supported subset maps task hierarchy, dates, durations, estimates, completion percentages, dependency types, working lags, resource names, maximum units and multiple positive-percentage assignments. Fixed-work data is read where it can be represented; exported completion is rounded to a whole percent. Custom summary-bar colors are not mapped to MPP.
 - Fixed-units tasks are approximated as fixed-duration and reported. Zero-percentage assignments are reported and omitted. Duplicate resource names from MPP are made distinct and reported. Unsupported summary links or unavailable lag units are reported and omitted; not all losses can be detected.
-- The reader may skip unscheduled tasks. Resource/task calendars, rates, costs, timephased data, progress, baselines, custom fields, constraints, manual scheduling and other Project-specific information are not comprehensively preserved.
+- The reader may skip unscheduled tasks. Resource/task calendars, rates, costs, timephased data, baselines, custom fields, constraints, manual scheduling and other Project-specific information are not comprehensively preserved.
 - **Confirmed import defect:** an MPP task with a 16 November 2026 13:00–17:00 start-no-earlier-than constraint was imported as 08:00–12:00. The general import warning appeared, but the per-task loss report was empty. Imported start timestamps are reduced to dates and treated as earliest-start dates; even originally unconstrained linked tasks may therefore fail to move earlier after their predecessors change. Fixing this is a priority before relying on imported schedules.
 
 ## 7. Verification and next priorities

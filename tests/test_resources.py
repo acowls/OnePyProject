@@ -32,7 +32,7 @@ def test_old_file_migrates_resources_without_losing_allocation(tmp_path):
     assert all(not task.resource for task in plan.tasks)
     assert schedule(plan)[1].work == 4
     save_plan(plan, path)
-    assert json.loads(path.read_text())["version"] == 2
+    assert json.loads(path.read_text())["version"] == 3
     assert load_plan(path) == plan
 
 

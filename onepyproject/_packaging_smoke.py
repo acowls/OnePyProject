@@ -40,6 +40,7 @@ def run():
         ):
             raise RuntimeError(f"SVG icon failed to render: {filename}")
     for filename in ("tree_open.svg", "tree_closed.svg", "ai_shield.svg", "ai_clear.svg", "ai_play.svg", "ai_stop.svg",
+                     "summary_color.svg",
                      "cut.svg", "copy.svg", "paste.svg"):
         image = QImage(str(ASSET_DIR.parent / "ui" / filename))
         if image.isNull():
@@ -50,7 +51,8 @@ def run():
     with TemporaryDirectory(prefix="onepyproject-smoke-") as directory:
         directory = Path(directory)
         plan = Plan(start="2026-11-16", resources=[Resource(1, "Example")],
-                    tasks=[Task(10, "Parent"), Task(20, "Child", parent=10, assignments=[ResourceAssignment(1)]),
+                    tasks=[Task(10, "Parent"), Task(20, "Child", parent=10, assignments=[ResourceAssignment(1)],
+                                                   percent_complete=50),
                            Task(30, "After", predecessors=[20])])
         path = directory / "smoke.pxplan"
         save_plan(plan, path)
@@ -124,6 +126,8 @@ def run():
         window.plan = plan
         window.show()
         window.refresh()
+        if window.tree.columnCount() != 10 or window.items[20].text(9) != "50.0%":
+            raise RuntimeError("Task completion column did not render")
         app.processEvents()
         window.tree.setCurrentItem(window.items[20], 1)
         context = window.task_context_menu()

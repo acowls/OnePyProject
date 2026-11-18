@@ -6,19 +6,23 @@ from datetime import date, datetime, timedelta
 from html import escape
 import math
 from pathlib import Path
+import re
 import sys
+import unicodedata
+import zlib
 
 from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTimer, QItemSelectionModel, QSettings
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+                               QFrame, QGroupBox, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStyledItemDelegate, QTabWidget, QToolBar, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QPointF
 
 from . import __version__
-from .model import Plan, Task, descendants, estimated_tasks, indent, load_plan, outdent, save_plan, schedule
+from .model import (Plan, Task, completion_percentages, descendants, estimated_tasks, indent, load_plan,
+                    outdent, save_plan, schedule)
 from .dependencies import parse_dependency, parse_display_predecessors, remap_predecessors, task_numbers
 from .icons import toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
@@ -38,8 +42,53 @@ from .ai.ui import AIAssistantDock
 DATE_FORMATS = ("system", "short", "long")
 MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 EMPTY_ROW_HINT = "Enter/dbl-click adds; Shift+Enter inserts"
-TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors", "resource", "work", "mode")
+TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors", "resource", "work", "mode", "complete")
 COLUMN_WIDTH_KEY = "display/task_column_widths"
+OPTIONAL_COLUMNS = (("finish", "Finish"), ("predecessors", "Predecessors"), ("resource", "Resource"),
+                    ("work", "Work"), ("mode", "Mode"), ("complete", "Complete"))
+SUMMARY_PALETTE = (
+    "#c9def2", "#9fc8e7", "#76add8", "#4c91c5",
+    "#cce8d6", "#a4d5b6", "#77bf91", "#4a9e6a",
+    "#ded3f0", "#bca8df", "#987bc9", "#7555ae",
+    "#f4dfb8", "#e9c982", "#d9aa51", "#bf8730",
+)
+SUMMARY_PALETTE_NAMES = (
+    "Blue mist", "Sky blue", "Lake blue", "Deep blue",
+    "Mint mist", "Soft green", "Leaf green", "Forest green",
+    "Lilac mist", "Soft violet", "Amethyst", "Deep violet",
+    "Cream", "Soft gold", "Amber", "Deep amber",
+)
+
+
+def summary_color(name: str) -> str:
+    """Stable 16-color assignment; phonetic first-word groups stay adjacent."""
+    normalized = unicodedata.normalize("NFKD", name.casefold()).encode("ascii", "ignore").decode("ascii")
+    words = [part for part in re.findall(r"[a-z]+", normalized)
+             if part not in {"phase", "stage", "task", "item", "complete", "completed"}]
+    if not words:
+        words = ["summary"]
+
+    def soundex(word):
+        codes = {**dict.fromkeys("bfpv", "1"), **dict.fromkeys("cgjkqsxz", "2"),
+                 **dict.fromkeys("dt", "3"), "l": "4", **dict.fromkeys("mn", "5"), "r": "6"}
+        first = word[0]
+        encoded = []
+        previous = codes.get(first, "")
+        for character in word[1:]:
+            current = codes.get(character, "")
+            if current and current != previous:
+                encoded.append(current)
+            previous = current
+        return first + "".join(encoded[:3]).ljust(3, "0")
+
+    hue_group = sum(ord(character) for character in soundex(words[0])) % 4
+    shade_seed = " ".join(sorted(words[1:] or words))
+    shade = zlib.crc32(shade_seed.encode("utf-8")) % 4
+    return SUMMARY_PALETTE[hue_group * 4 + shade]
+
+
+def collapsed_summary_color(name: str, automatic: bool, custom: str = "") -> str:
+    return custom or (summary_color(name) if automatic else "#72a9e0")
 
 
 def display_time(value: datetime, date_format: str = "system", include_time: bool = True) -> str:
@@ -285,6 +334,13 @@ class TaskDelegate(QStyledItemDelegate):
                 self.closeEditor.emit(editor)
             editor.activated.connect(commit_selection)
             return editor
+        if index.column() == 9:
+            editor = QDoubleSpinBox(parent)
+            editor.setRange(0, 100)
+            editor.setDecimals(1)
+            editor.setSuffix(" %")
+            editor.setAccessibleName("Task percent complete")
+            return editor
         editor = QLineEdit(parent)
         if index.column() == 2:
             self.window.tree.duration_editor = editor
@@ -298,6 +354,15 @@ class TaskDelegate(QStyledItemDelegate):
         return editor
 
     def updateEditorGeometry(self, editor, option, index):
+        if index.column() == 9 and isinstance(editor, QDoubleSpinBox):
+            cell = option.rect
+            viewport = editor.parentWidget()
+            width = min(viewport.width(), max(cell.width(), editor.sizeHint().width()))
+            height = min(viewport.height(), max(cell.height(), editor.sizeHint().height()))
+            x = max(0, min(cell.right() + 1 - width, viewport.width() - width))
+            y = max(0, min(cell.y() + (cell.height() - height) // 2, viewport.height() - height))
+            editor.setGeometry(x, y, width, height)
+            return
         if index.column() != 8 or not isinstance(editor, QComboBox):
             return super().updateEditorGeometry(editor, option, index)
         # Temporarily expand a narrow cell so both the full label and arrow fit,
@@ -321,6 +386,9 @@ class TaskDelegate(QStyledItemDelegate):
         if column == 8:
             editor.setCurrentIndex(editor.findData(task.mode))
             return
+        if column == 9:
+            editor.setValue(task.percent_complete)
+            return
         displayed = remap_predecessors(task.predecessors, task_numbers(self.window.plan.tasks))
         values = {1: task.name, 2: f"{task.duration}{'?' if task.estimated else ''}",
                   3: task.earliest or self.window.calculated[uid].start.date().isoformat(),
@@ -331,7 +399,7 @@ class TaskDelegate(QStyledItemDelegate):
     def setModelData(self, editor, model, index):
         uid = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
         column = index.column()
-        value = editor.currentData() if column == 8 else editor.text()
+        value = editor.currentData() if column == 8 else editor.value() if column == 9 else editor.text()
         current_plan = self.window.plan
         row = self.window.tree.itemFromIndex(index)
         before = self.window.tree.insertion_before if row is self.window.tree.insertion else None
@@ -351,7 +419,7 @@ class TaskDialog(QDialog):
         super().__init__(parent)
         numbers = task_numbers(plan.tasks)
         self.setWindowTitle(f"Task {numbers.get(task.uid, len(plan.tasks) + 1)}")
-        self.resize(430, 350)
+        self.resize(860, 460)
         self.initial_mode = task.mode
         calculated = schedule(plan).get(task.uid) if any(other.uid == task.uid for other in plan.tasks) else None
         self.display_duration = calculated.duration if calculated and task.mode == "work" else task.duration
@@ -361,8 +429,10 @@ class TaskDialog(QDialog):
         self.work_changed = False
         layout = QVBoxLayout(self)
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         layout.addLayout(form)
         self.name = QLineEdit(task.name)
+        self.name.setMinimumWidth(500)
         self.earliest = QLineEdit(task.earliest)
         self.earliest.setPlaceholderText("YYYY-MM-DD; blank uses project start")
         self.mode = QComboBox()
@@ -374,9 +444,18 @@ class TaskDialog(QDialog):
         self.duration.setDecimals(2)
         self.duration.setValue(self.display_duration)
         self.duration.setSuffix(" days")
+        self.duration.setMaximumWidth(260)
         self.duration.valueChanged.connect(lambda _value: setattr(self, "duration_changed", True))
-        self.estimated = QCheckBox("Estimated duration (?)")
+        self.estimated = QCheckBox("Estimated")
+        self.estimated.setAccessibleName("Estimated duration")
+        self.estimated.setToolTip("Mark this duration as estimated; estimated values show a ?")
         self.estimated.setChecked(task.estimated)
+        self.duration_row = QWidget()
+        duration_layout = QHBoxLayout(self.duration_row)
+        duration_layout.setContentsMargins(0, 0, 0, 0)
+        duration_layout.addWidget(self.duration)
+        duration_layout.addWidget(self.estimated)
+        duration_layout.addStretch()
         self.work = QDoubleSpinBox()
         self.work.setRange(0, 800000)
         self.work.setDecimals(2)
@@ -384,18 +463,57 @@ class TaskDialog(QDialog):
         self.work.setSuffix(" hours")
         self.work.valueChanged.connect(lambda _value: setattr(self, "work_changed", True))
         self.resource = QLineEdit(format_task_resources(plan, task))
+        self.resource.setMinimumWidth(500)
         self.resource.setPlaceholderText("Ada[50%], Ben")
         self.summary = any(other.parent == task.uid for other in plan.tasks)
+        self.summary_color_value = task.summary_color
+        color_row = QWidget()
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(2)
+        self.summary_color_buttons = {}
+        self.default_color_button = self._make_summary_color_button(
+            "", "Default / Auto (blue bar)", "A")
+        color_layout.addWidget(self.default_color_button)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        color_layout.addWidget(divider)
+        for name, color in zip(SUMMARY_PALETTE_NAMES, SUMMARY_PALETTE):
+            button = self._make_summary_color_button(color, name)
+            color_layout.addWidget(button)
+        self.custom_color_button = QPushButton("Custom")
+        self.custom_color_button.setAccessibleName("Choose custom summary color")
+        self.custom_color_button.setToolTip("Choose any custom color")
+        self.custom_color_button.clicked.connect(self.choose_summary_color)
+        color_layout.addWidget(self.custom_color_button)
+        self._update_summary_color_buttons()
+        self.summary_color_row = color_row
+        color_layout.addStretch()
+        self.percent_complete = QDoubleSpinBox()
+        self.percent_complete.setRange(0, 100)
+        self.percent_complete.setDecimals(1)
+        self.percent_complete.setSuffix(" %")
+        self.percent_complete.setValue(completion_percentages(plan).get(task.uid, task.percent_complete))
+        self.percent_changed = False
+        self.percent_complete.valueChanged.connect(lambda _value: setattr(self, "percent_changed", True))
+        self.percent_complete.setEnabled(not self.summary)
+        if self.summary:
+            self.percent_complete.setToolTip("Summary completion is calculated from its subtasks.")
         if self.summary:
             self.resource.setReadOnly(True)
             self.resource.setToolTip("Summary assignments cannot be added; use Assign to remove existing ones.")
         self.original_predecessors = ", ".join(map(str, remap_predecessors(task.predecessors, numbers)))
         self.predecessors = QLineEdit(self.original_predecessors)
+        self.predecessors.setMinimumWidth(500)
         self.predecessors.setPlaceholderText("e.g. 5FS+2d, 6SS-1d")
         for label, widget in (("Name", self.name), ("Earliest start", self.earliest),
-                              ("Scheduling", self.mode), ("Duration", self.duration), ("Estimate", self.estimated),
-                              ("Work", self.work), ("Resources", self.resource), ("Predecessors", self.predecessors)):
+                              ("Scheduling", self.mode), ("Duration", self.duration_row),
+                              ("Complete", self.percent_complete), ("Work", self.work), ("Resources", self.resource),
+                              ("Predecessors", self.predecessors)):
             form.addRow(label, widget)
+        if self.summary:
+            form.addRow("Summary bar", color_row)
         hint = QLabel("A duration or work of 0 creates a milestone. Summary dates are calculated from children.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -413,22 +531,65 @@ class TaskDialog(QDialog):
         elif self.initial_mode == "work" and task.mode == "duration":
             task.duration = self.display_duration
         task.estimated = self.estimated.isChecked()
+        if not self.summary and self.percent_changed:
+            task.percent_complete = self.percent_complete.value()
         if self.work_changed:
             task.work = self.work.value()
         elif self.initial_mode == "duration" and task.mode == "work":
             task.work = self.display_work
         if not self.summary:
             set_task_resources(plan, task, self.resource.text())
+        else:
+            task.summary_color = self.summary_color_value
         if self.predecessors.text() != self.original_predecessors:
             task.predecessors = parse_display_predecessors(self.predecessors.text(), plan.tasks)
+
+    def _make_summary_color_button(self, color, label, text=""):
+        button = QPushButton(text)
+        button.setFixedSize(20, 20)
+        button.setToolTip(label)
+        button.setAccessibleName(label)
+        button.clicked.connect(lambda checked=False, value=color: self.set_summary_color(value))
+        if color:
+            self.summary_color_buttons[color] = button
+        else:
+            self.default_color_button = button
+        return button
+
+    def _update_summary_color_buttons(self):
+        for color, button in self.summary_color_buttons.items():
+            chosen = color.casefold() == self.summary_color_value.casefold()
+            button.setStyleSheet(
+                f"QPushButton {{ background: {color}; color: #17212b; border: "
+                f"{3 if chosen else 1}px solid {'#102b43' if chosen else '#8799a8'}; border-radius: 3px; }}")
+        is_default = not self.summary_color_value
+        self.default_color_button.setStyleSheet(
+            f"QPushButton {{ background: #72a9e0; color: #102b43; border: "
+            f"{3 if is_default else 1}px solid {'#102b43' if is_default else '#8799a8'}; border-radius: 3px; font-weight: bold; }}")
+        is_custom = bool(self.summary_color_value) and self.summary_color_value.casefold() not in {
+            color.casefold() for color in self.summary_color_buttons}
+        self.custom_color_button.setStyleSheet(
+            "QPushButton { background: #edf3f7; color: #17334a; "
+            f"border: {2 if is_custom else 1}px solid {'#102b43' if is_custom else '#a3b3bf'}; border-radius: 3px; padding: 2px 6px; }}")
+
+    def set_summary_color(self, color):
+        self.summary_color_value = color
+        self._update_summary_color_buttons()
+
+    def choose_summary_color(self):
+        initial = QColor(self.summary_color_value or summary_color(self.name.text()))
+        chosen = QColorDialog.getColor(initial, self, "Choose collapsed summary color")
+        if chosen.isValid():
+            self.set_summary_color(chosen.name())
 
 
 class SettingsDialog(QDialog):
     def __init__(self, plan: Plan, parent=None, digit_edits_duration=True, date_format="system",
-                 show_icon_labels=False, settings_location="", confirm_task_deletion=True, density=DEFAULT_DENSITY):
+                 show_icon_labels=False, settings_location="", confirm_task_deletion=True, density=DEFAULT_DENSITY,
+                 visible_columns=None, color_collapsed_summaries=True):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(650, 420)
+        self.resize(700, 600)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("QTabWidget::pane { background: palette(window); }")
@@ -479,12 +640,26 @@ class SettingsDialog(QDialog):
             self.density_selector.addItem(name.capitalize(), name)
         self.density_selector.setCurrentIndex(max(0, self.density_selector.findData(density)))
         form.addRow("Layout", self.density_selector)
+        self.color_collapsed_summaries = QCheckBox("Automatically color collapsed summary bars")
+        self.color_collapsed_summaries.setChecked(color_collapsed_summaries)
+        self.color_collapsed_summaries.setToolTip("Similar task names use related colors. Expanded summaries remain black.")
+        form.addRow("Gantt", self.color_collapsed_summaries)
         self.settings_location = QLineEdit(settings_location)
         self.settings_location.setReadOnly(True)
         self.settings_location.setCursorPosition(0)
         self.settings_location.setToolTip("Application preferences are stored separately from the project file.\n" + settings_location)
         form.addRow("Preferences location", self.settings_location)
         preferences_layout.addLayout(form)
+        visibility = QGroupBox("Optional task columns")
+        visibility_grid = QGridLayout(visibility)
+        visible_columns = visible_columns or {}
+        self.column_visibility = {}
+        for index, (key, label) in enumerate(OPTIONAL_COLUMNS):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(visible_columns.get(key, True))
+            self.column_visibility[key] = checkbox
+            visibility_grid.addWidget(checkbox, index // 3, index % 3)
+        preferences_layout.addWidget(visibility)
         preferences_layout.addStretch()
         self.tabs.addTab(preferences_tab, "User preferences")
         layout.addWidget(self.tabs)
@@ -775,6 +950,7 @@ class Gantt(QWidget):
 
         positions = {}
         preview_rows = {row.uid: row for row in preview.rows} if preview else {}
+        progress_values = preview.after_progress if preview else self.window.progress_percentages
         for uid, tree_item in self.window.items.items():
             rect = tree.visualItemRect(tree_item)
             if rect.isEmpty():
@@ -788,22 +964,25 @@ class Gantt(QWidget):
             p.drawLine(0, header + rect.bottom(), self.width(), header + rect.bottom())
             if row is not None:
                 self.draw_preview_bar(p, item, y, proposed=row.before is None)
+                base_progress = row.before_progress if row.before is not None else row.after_progress
+                self.draw_completion(p, item, y, base_progress or 0, summary=item.summary and not tree_item.isExpanded())
                 if row.before and row.after and (row.before.start != row.after.start or row.before.finish != row.after.finish):
                     self.draw_preview_bar(p, row.after, y, proposed=True)
             elif item.summary:
-                p.setPen(QPen(QColor("#343c49"), 3))
-                p.drawLine(int(start), int(y - 3), int(max(start + 2, finish)), int(y - 3))
-                p.drawLine(int(start), int(y - 3), int(start), int(y + 4))
-                p.drawLine(int(finish), int(y - 3), int(finish), int(y + 4))
+                task = next(task for task in self.window.plan.tasks if task.uid == uid)
+                self.draw_summary_bar(p, item, y, task.name, tree_item.isExpanded(),
+                                      progress_values.get(uid, 0), task.summary_color)
             elif item.duration == 0:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#344d69"))
                 p.drawPolygon(QPolygonF([QPointF(start, y - 6), QPointF(start + 6, y),
                                          QPointF(start, y + 6), QPointF(start - 6, y)]))
+                self.draw_completion(p, item, y, progress_values.get(uid, 0))
             else:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor("#72a9e0"))
                 p.drawRoundedRect(QRectF(start, y - 6, max(5, finish - start), 12), 2, 2)
+                self.draw_completion(p, item, y, progress_values.get(uid, 0))
         # Draw FS links for visible rows, without affecting bar hit testing.
         p.setPen(QPen(QColor("#5484b7"), 1))
         for task in (() if preview else self.window.plan.tasks):
@@ -823,6 +1002,37 @@ class Gantt(QWidget):
                 p.drawLine(int(elbow), int(sy), int(endpoint), int(sy))
         p.restore()
         p.end()
+
+    def draw_summary_bar(self, painter, item, y, name, expanded, progress, custom_color=""):
+        start, finish = self.x(item.start), self.x(item.finish)
+        if expanded:
+            painter.setPen(QPen(QColor("#343c49"), 3))
+            painter.drawLine(int(start), int(y - 3), int(max(start + 2, finish)), int(y - 3))
+            painter.drawLine(int(start), int(y - 3), int(start), int(y + 4))
+            painter.drawLine(int(finish), int(y - 3), int(finish), int(y + 4))
+        else:
+            color = collapsed_summary_color(name, self.window.color_collapsed_summaries, custom_color)
+            painter.setPen(QPen(QColor(color).darker(125), 1))
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(QRectF(start, y - 6, max(5, finish - start), 12), 2, 2)
+        self.draw_completion(painter, item, y, progress, summary=not expanded)
+
+    def draw_completion(self, painter, item, y, percent, summary=False):
+        if percent <= 0:
+            return
+        start, finish = self.x(item.start), self.x(item.finish)
+        if item.duration == 0:
+            if percent >= 100:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#17334a"))
+                painter.drawPolygon(QPolygonF([QPointF(start, y - 3), QPointF(start + 3, y),
+                                               QPointF(start, y + 3), QPointF(start - 3, y)]))
+            return
+        end = start + max(0, finish - start) * max(0, min(100, percent)) / 100
+        if percent >= 100:
+            end = finish
+        painter.setPen(QPen(QColor("#17334a"), 4 if summary else 3, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(start, y), QPointF(end, y))
 
     def draw_preview_bar(self, painter, item, y, proposed=False):
         start, finish = self.x(item.start), self.x(item.finish)
@@ -844,6 +1054,11 @@ class MainWindow(QMainWindow):
         self.preferences = preferences if preferences is not None else application_preferences()
         self.digit_edits_duration = self.preferences.value("keyboard/digit_edits_duration", True, type=bool)
         self.confirm_task_deletion = self.preferences.value("editing/confirm_task_deletion", True, type=bool)
+        self.color_collapsed_summaries = self.preferences.value("display/color_collapsed_summaries", True, type=bool)
+        self.visible_task_columns = {
+            key: self.preferences.value(f"display/task_column_visibility/{key}", True, type=bool)
+            for key, _label in OPTIONAL_COLUMNS
+        }
         self.show_icon_labels = self.preferences.value("display/show_icon_labels", False, type=bool)
         self.date_format = self.preferences.value("display/date_format", "system", type=str)
         if self.date_format not in DATE_FORMATS:
@@ -963,8 +1178,8 @@ class MainWindow(QMainWindow):
             action.setShortcuts(shortcut)
             action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
             self.tree.viewport().addAction(action)
-        self.tree.setColumnCount(9)
-        self.tree.setHeaderLabels(["ID", "Task", "Duration", "Start", "Finish", "Predecessors", "Resource", "Work", "Mode"])
+        self.tree.setColumnCount(10)
+        self.tree.setHeaderLabels(["ID", "Task", "Duration", "Start", "Finish", "Predecessors", "Resource", "Work", "Mode", "Complete"])
         self.tree.setTreePosition(1)
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
@@ -985,7 +1200,7 @@ class MainWindow(QMainWindow):
         duration_width = header_metrics.horizontalAdvance("Duration") + 14
         date_width = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
         work_width = max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
-        for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90)):
+        for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90, 82)):
             value = self.preferences.value(f"{COLUMN_WIDTH_KEY}/{TASK_COLUMN_KEYS[i]}", None)
             if isinstance(value, int) and not isinstance(value, bool):
                 saved_width = value
@@ -996,11 +1211,13 @@ class MainWindow(QMainWindow):
             if header.minimumSectionSize() <= saved_width <= header.maximumSectionSize():
                 width = saved_width
             self.tree.setColumnWidth(i, width)
+        self.apply_column_visibility()
         splitter.addWidget(self.tree)
         self.chart_area = CalendarScrollArea(self)
         self.chart_area.setWidgetResizable(False)
         self.chart_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.gantt = Gantt(self)
+        self.gantt.setToolTip("A dark line through a task bar shows percent complete. Collapsed summary bars can be colored from the Project toolbar.")
         self.gantt.DAY = self.ZOOM_STEPS[self.zoom_index]
         self.chart_area.setWidget(self.gantt)
         splitter.addWidget(self.chart_area)
@@ -1020,7 +1237,12 @@ class MainWindow(QMainWindow):
             QStatusBar::item { border: 0; }
             QTreeWidget { border: 0; background: white; color: #24354a; alternate-background-color: #f9fafc; }
             QTreeWidget::item { height: 29px; color: #24354a; }
-            QTreeWidget::item:selected { background: #d5e9fa; color: #183753; }
+            QTreeWidget::item:selected { background: #b9d8f2; color: #102b43; }
+            QTreeWidget::item:focus { border: 0; outline: none; }
+            QTreeWidget::branch:has-children:closed:selected,
+            QTreeWidget::branch:has-children:open:selected { background: #b9d8f2; border: 0; }
+            QTreeWidget::branch:has-children:closed:focus,
+            QTreeWidget::branch:has-children:open:focus { background: #b9d8f2; border: 0; }
             QHeaderView::section { background: #f4f6f9; padding: 6px; border: 0; border-right: 1px solid #e3e7ed; color: #54657b; }
         """)
         self.zoom_indicator.setFixedWidth(self.zoom_indicator.sizeHint().width())
@@ -1048,13 +1270,22 @@ class MainWindow(QMainWindow):
         self.tree.setStyleSheet(f"""
             QTreeWidget {{ border: 0; background: white; color: #24354a; alternate-background-color: #f9fafc; }}
             QTreeWidget::item {{ height: {height}px; color: #24354a; }}
-            QTreeWidget::item:selected {{ background: #d5e9fa; color: #183753; }}
+            QTreeWidget::item:selected {{ background: #b9d8f2; color: #102b43; }}
+            QTreeWidget::item:focus {{ border: 0; outline: none; }}
             QTreeWidget::branch:has-children:closed {{ image: url("{closed_icon}"); }}
             QTreeWidget::branch:has-children:open {{ image: url("{open_icon}"); }}
+            QTreeWidget::branch:has-children:closed:selected,
+            QTreeWidget::branch:has-children:open:selected {{ background: #b9d8f2; border: 0; }}
+            QTreeWidget::branch:has-children:closed:focus,
+            QTreeWidget::branch:has-children:open:focus {{ background: #b9d8f2; border: 0; }}
         """)
         self.tree.doItemsLayout()
         if hasattr(self, "gantt"):
             self.gantt.sync()
+
+    def apply_column_visibility(self):
+        for key, _label in OPTIONAL_COLUMNS:
+            self.tree.setColumnHidden(TASK_COLUMN_KEYS.index(key), not self.visible_task_columns.get(key, True))
 
     def save_column_width(self, index, _old_width, new_width):
         if 0 <= index < len(TASK_COLUMN_KEYS):
@@ -1214,6 +1445,8 @@ class MainWindow(QMainWindow):
         else:
             selection = [selected] if isinstance(selected, int) else list(selected)
         self.calculated = schedule(self.plan)
+        progress = completion_percentages(self.plan, self.calculated)
+        self.progress_percentages = progress
         self.resource_warnings = overallocation_warnings(self.plan)
         estimates = estimated_tasks(self.plan)
         numbers = task_numbers(self.plan.tasks)
@@ -1228,7 +1461,8 @@ class MainWindow(QMainWindow):
             values = [str(numbers[task.uid]), task.name, f"{item.duration:g} d{'?' if estimates[task.uid] else ''}",
                       start, finish,
                       ", ".join(map(str, remap_predecessors(task.predecessors, numbers))), format_task_resources(self.plan, task),
-                      f"{item.work:g} h", "Work" if task.mode == "work" else "Duration"]
+                      f"{item.work:g} h", "Work" if task.mode == "work" else "Duration",
+                      f"{progress[task.uid]:.1f}%"]
             node = QTreeWidgetItem(values)
             node.setData(0, Qt.ItemDataRole.UserRole, task.uid)
             node.setFlags(node.flags() | Qt.ItemFlag.ItemIsEditable)
@@ -1236,6 +1470,7 @@ class MainWindow(QMainWindow):
             node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
             node.setToolTip(4, display_time(item.finish, self.date_format))
             node.setToolTip(5, "Use displayed task IDs: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas.")
+            node.setToolTip(9, "Task completion is user-entered; summary completion is weighted by child work.")
             if item.summary and (task.assignments or task.resource.strip()):
                 node.setToolTip(6, "Summary resources are retained but not included in scheduling or MPP export.")
             elif any(assignment.resource_uid in self.resource_warnings for assignment in task.assignments):
@@ -1244,7 +1479,7 @@ class MainWindow(QMainWindow):
             if item.summary:
                 font = QFont()
                 font.setBold(True)
-                for col in range(9):
+                for col in range(10):
                     node.setFont(col, font)
             if task.parent:
                 self.items[task.parent].addChild(node)
@@ -1357,7 +1592,7 @@ class MainWindow(QMainWindow):
             node = QTreeWidgetItem(list(row.values))
             node.setData(0, Qt.ItemDataRole.UserRole, row.uid)
             node.setFlags(node.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            for col in range(9):
+            for col in range(10):
                 color = CHANGED_CELL if row.status == "changed" and col in row.changed_columns else ROW_COLORS.get(row.status)
                 if color:
                     node.setBackground(col, QColor(color))
@@ -1370,7 +1605,7 @@ class MainWindow(QMainWindow):
             if item and item.summary:
                 font = QFont()
                 font.setBold(True)
-                for col in range(9):
+                for col in range(10):
                     node.setFont(col, font)
             if row.parent:
                 self.items[row.parent].addChild(node)
@@ -1460,6 +1695,8 @@ class MainWindow(QMainWindow):
             return True
         if self.calculated[task.uid].summary:
             return False
+        if column == 9:
+            return True
         if column == 2:
             return task.mode == "duration"
         if column == 7:
@@ -1471,7 +1708,7 @@ class MainWindow(QMainWindow):
         if task is None or not self.can_edit_cell(task, column):
             return
         def update():
-            text = value.strip()
+            text = str(value).strip()
             if column == 1:
                 task.name = text
             elif column == 2:
@@ -1506,6 +1743,10 @@ class MainWindow(QMainWindow):
                 elif text == "duration" and task.mode != "duration":
                     task.duration = self.calculated[uid].duration
                 task.mode = text
+            elif column == 9:
+                task.percent_complete = float(text.removesuffix("%").strip())
+                if not 0 <= task.percent_complete <= 100:
+                    raise ValueError("Percent complete must be between 0 and 100")
         self.mutate(update, uid)
 
     def link_tasks(self):
@@ -1660,7 +1901,8 @@ class MainWindow(QMainWindow):
 
     def settings(self):
         dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,
-                                self.show_icon_labels, self.preferences.fileName(), self.confirm_task_deletion, self.density)
+                                self.show_icon_labels, self.preferences.fileName(), self.confirm_task_deletion, self.density,
+                                self.visible_task_columns, self.color_collapsed_summaries)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             def update():
                 self.plan.title = dialog.title.text().strip() or "Untitled project"
@@ -1671,6 +1913,9 @@ class MainWindow(QMainWindow):
                 self.digit_edits_duration = dialog.digit_edits_duration.isChecked()
                 self.confirm_task_deletion = dialog.confirm_task_deletion.isChecked()
                 self.show_icon_labels = dialog.show_icon_labels.isChecked()
+                self.color_collapsed_summaries = dialog.color_collapsed_summaries.isChecked()
+                self.visible_task_columns = {key: checkbox.isChecked()
+                                             for key, checkbox in dialog.column_visibility.items()}
                 previous_density = self.density
                 self.density = dialog.density_selector.currentData()
                 previous_date_format = self.date_format
@@ -1680,8 +1925,13 @@ class MainWindow(QMainWindow):
                 self.preferences.setValue(DENSITY_PREFERENCE_KEY, self.density)
                 self.preferences.setValue("display/show_icon_labels", self.show_icon_labels)
                 self.preferences.setValue("display/date_format", self.date_format)
+                self.preferences.setValue("display/color_collapsed_summaries", self.color_collapsed_summaries)
+                for key, visible in self.visible_task_columns.items():
+                    self.preferences.setValue(f"display/task_column_visibility/{key}", visible)
                 self.sync_preferences()
                 self.apply_toolbar_labels()
+                self.apply_column_visibility()
+                self.gantt.update()
                 if self.density != previous_density:
                     self.apply_density()
                 if self.date_format != previous_date_format:

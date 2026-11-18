@@ -21,7 +21,7 @@ def sample_plan():
     return Plan(title='R&D <script>alert("x")</script>', start="2026-11-16",
                 resources=[Resource(1, 'Ada <img src="https://invalid.example">')],
                 tasks=[Task(1, "Summary"),
-                       Task(2, "Design & research", parent=1, duration=0.5, estimated=True,
+                       Task(2, "Design & research", parent=1, duration=0.5, estimated=True, percent_complete=50,
                             assignments=[ResourceAssignment(1, 50)]),
                        Task(3, "Milestone", parent=1, duration=0, predecessors=["2FS+0.1m"])])
 
@@ -68,6 +68,8 @@ def test_html_is_single_offline_document_and_escapes_project_text(tmp_path):
     assert 'Parent: 1' in contents and '2FS+0.1m' in contents and '0.5 d?' in contents
     assert '2026-11-16' in contents and '13:00:06' not in contents
     assert 'summary-bar' in contents and 'milestone' in contents
+    assert "<th>Complete</th>" in contents and "50.0%" in contents
+    assert make_report(plan).rows[1].percent_complete == "50.0%"
 
 
 def test_report_timeline_handles_single_milestone_and_empty_plan(tmp_path):

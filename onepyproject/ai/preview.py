@@ -5,7 +5,7 @@ import copy
 from dataclasses import dataclass
 
 from ..dependencies import remap_predecessors, task_numbers
-from ..model import Plan, Scheduled, estimated_tasks, schedule
+from ..model import Plan, Scheduled, completion_percentages, estimated_tasks, schedule
 from ..resources import format_task_resources
 from .diff import PlanDiff, compare_plans
 
@@ -28,6 +28,8 @@ class PreviewRow:
     before: Scheduled | None
     after: Scheduled | None
     details: str
+    before_progress: float | None
+    after_progress: float | None
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,8 @@ class PreviewData:
     after: Plan
     rows: tuple[PreviewRow, ...]
     diff: PlanDiff
+    before_progress: dict[int, float]
+    after_progress: dict[int, float]
 
 
 def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
@@ -44,15 +48,18 @@ def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
     old_schedule, new_schedule = schedule(old_plan), schedule(new_plan)
     old_numbers, new_numbers = task_numbers(old_plan.tasks), task_numbers(new_plan.tasks)
     old_estimates, new_estimates = estimated_tasks(old_plan), estimated_tasks(new_plan)
+    old_progress = completion_percentages(old_plan, old_schedule)
+    new_progress = completion_percentages(new_plan, new_schedule)
     old_tasks, new_tasks = {task.uid: task for task in old_plan.tasks}, {task.uid: task for task in new_plan.tasks}
     diff = compare_plans(old_plan, new_plan)
 
-    def values(plan, task, calculated, numbers, estimates):
+    def values(plan, task, calculated, numbers, estimates, progress):
         timed = 0 < calculated.duration < 1
         return (str(numbers[task.uid]), task.name, f"{calculated.duration:g} d{'?' if estimates[task.uid] else ''}",
                 format_date(calculated.start, include_time=timed), format_date(calculated.finish, include_time=timed),
                 ", ".join(map(str, remap_predecessors(task.predecessors, numbers))),
-                format_task_resources(plan, task), f"{calculated.work:g} h", "Work" if task.mode == "work" else "Duration")
+                format_task_resources(plan, task), f"{calculated.work:g} h", "Work" if task.mode == "work" else "Duration",
+                f"{progress[task.uid]:.1f}%")
 
     children = {0: []}
     for task in new_plan.tasks:
@@ -84,14 +91,15 @@ def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
     for uid in ordered:
         old, new = old_tasks.get(uid), new_tasks.get(uid)
         old_item, new_item = old_schedule.get(uid), new_schedule.get(uid)
-        old_values = values(old_plan, old, old_item, old_numbers, old_estimates) if old else None
-        new_values = values(new_plan, new, new_item, new_numbers, new_estimates) if new else None
+        old_values = values(old_plan, old, old_item, old_numbers, old_estimates, old_progress) if old else None
+        new_values = values(new_plan, new, new_item, new_numbers, new_estimates, new_progress) if new else None
         changed = set()
         details = []
         if old and new:
-            changed.update(i for i in range(9) if old_values[i] != new_values[i])
+            changed.update(i for i in range(10) if old_values[i] != new_values[i])
             for column, fields in ((1, ("name",)), (2, ("duration", "estimated")), (5, ("predecessors",)),
-                                   (6, ("assignments", "resource", "units")), (7, ("work",)), (8, ("mode",))):
+                                   (6, ("assignments", "resource", "units")), (7, ("work",)), (8, ("mode",)),
+                                   (9, ("percent_complete",))):
                 if any(getattr(old, field) != getattr(new, field) for field in fields):
                     changed.add(column)
             if old.parent != new.parent:
@@ -112,5 +120,6 @@ def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
             status = "added" if new else "removed"
         rows.append(PreviewRow(uid, new.parent if new else old.parent, status,
                                new_values if new else old_values, old_values,
-                               frozenset(changed), old_item, new_item, "\n".join(details)))
-    return PreviewData(old_plan, new_plan, tuple(rows), diff)
+                               frozenset(changed), old_item, new_item, "\n".join(details),
+                               old_progress.get(uid), new_progress.get(uid)))
+    return PreviewData(old_plan, new_plan, tuple(rows), diff, old_progress, new_progress)

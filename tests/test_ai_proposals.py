@@ -38,6 +38,13 @@ def test_snapshot_is_detached_and_uses_stable_refs_with_display_numbers():
     assert "path" not in json.dumps(snapshot.payload).lower()
 
 
+def test_snapshot_includes_progress_as_readonly_context():
+    snapshot = make_snapshot(Plan(start="2026-11-16", tasks=[Task(1, "Phase"),
+        Task(2, "Child", parent=1, duration=2, percent_complete=50)]))
+    assert snapshot.payload["tasks"][1]["percent_complete"] == 50
+    assert snapshot.payload["tasks"][0]["calculated"]["percent_complete"] == 50
+
+
 def test_create_tasks_resources_and_dependencies_on_copy():
     plan = sample_plan()
     baseline = copy.deepcopy(plan)

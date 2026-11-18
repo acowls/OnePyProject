@@ -13,10 +13,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, QSize, QTime, QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QLineEdit, QMessageBox,
-                               QStyle, QStyleOptionComboBox)
+from PySide6.QtWidgets import (QApplication, QComboBox, QColorDialog, QDialog, QDoubleSpinBox, QFileDialog, QLineEdit, QMessageBox,
+                               QPushButton, QStyle, QStyleOptionComboBox)
 
-from onepyproject.app import COLUMN_WIDTH_KEY, EMPTY_ROW_HINT, TASK_COLUMN_KEYS, ExportDialog, MainWindow, SettingsDialog, TaskDialog, display_time
+from onepyproject.app import (COLUMN_WIDTH_KEY, EMPTY_ROW_HINT, OPTIONAL_COLUMNS, SUMMARY_PALETTE, SUMMARY_PALETTE_NAMES,
+                              TASK_COLUMN_KEYS, ExportDialog,
+                              MainWindow, SettingsDialog, TaskDialog, collapsed_summary_color, display_time, summary_color)
 from onepyproject.icons import ASSET_DIR, ICON_FILES, toolbar_icon
 from onepyproject.model import Plan, Task, load_plan, save_plan, schedule
 from onepyproject.mpp import import_mpp
@@ -303,6 +305,8 @@ def test_settings_separates_project_and_user_preferences_and_holidays_are_multil
         assert all(project.isAncestorOf(widget) for widget in (dialog.title, dialog.start, dialog.holidays))
         assert all(user.isAncestorOf(widget) for widget in (dialog.density_selector, dialog.date_format,
                                                               dialog.confirm_task_deletion, dialog.settings_location))
+        assert user.isAncestorOf(dialog.color_collapsed_summaries)
+        assert all(user.isAncestorOf(checkbox) for checkbox in dialog.column_visibility.values())
         assert dialog.holidays.toPlainText() == "2026-12-25\n2027-01-01"
         dialog.holidays.setPlainText("2026-12-24, 2026-12-25\n\n2027-01-01\n")
         dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
@@ -330,6 +334,173 @@ def test_invalid_multiline_holiday_does_not_save_preferences(app, tmp_path, monk
     window.settings()
     assert errors and window.plan.holidays == [] and not window.dirty
     assert window.density == "comfortable" and not preferences.contains(DENSITY_PREFERENCE_KEY)
+    window.close()
+
+
+def test_optional_columns_and_summary_color_are_user_preferences(app, tmp_path, monkeypatch):
+    path = str(tmp_path / "column-visibility.ini")
+    preferences = QSettings(path, QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    assert window.color_collapsed_summaries is True
+    assert all(window.tree.isColumnHidden(TASK_COLUMN_KEYS.index(key)) is False
+               for key, _label in OPTIONAL_COLUMNS)
+    def choose(dialog):
+        assert all(dialog.column_visibility[key].isChecked() for key, _label in OPTIONAL_COLUMNS)
+        dialog.column_visibility["finish"].setChecked(False)
+        dialog.column_visibility["work"].setChecked(False)
+        dialog.color_collapsed_summaries.setChecked(False)
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", choose)
+    window.settings()
+    assert window.tree.isColumnHidden(TASK_COLUMN_KEYS.index("finish"))
+    assert window.tree.isColumnHidden(TASK_COLUMN_KEYS.index("work"))
+    assert not window.tree.isColumnHidden(TASK_COLUMN_KEYS.index("resource"))
+    reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert reopened.tree.isColumnHidden(TASK_COLUMN_KEYS.index("finish"))
+    assert reopened.tree.isColumnHidden(TASK_COLUMN_KEYS.index("work"))
+    assert not reopened.color_collapsed_summaries
+    window.close()
+    reopened.close()
+
+
+def test_task_dialog_sets_and_clears_custom_summary_color(app, monkeypatch):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase"), Task(2, "Child", parent=1)])
+    dialog = TaskDialog(plan.tasks[0], plan)
+    assert not dialog.default_color_button.isHidden()
+    assert dialog.default_color_button.toolTip() == "Default / Auto (blue bar)"
+    assert len(dialog.summary_color_buttons) == 16 and dialog.custom_color_button.text() == "Custom"
+    swatches = dialog.summary_color_row.findChildren(QPushButton)
+    assert swatches[0] is dialog.default_color_button and swatches[-1] is dialog.custom_color_button
+    assert swatches[1].toolTip() == SUMMARY_PALETTE_NAMES[0]
+    monkeypatch.setattr(QColorDialog, "getColor", lambda *args: QColor("#f08040"))
+    dialog.choose_summary_color()
+    assert dialog.summary_color_value == "#f08040"
+    assert "2px solid" in dialog.custom_color_button.styleSheet()
+    dialog.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].summary_color == "#f08040"
+    dialog.set_summary_color("")
+    dialog.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].summary_color == ""
+
+
+def test_task_dialog_widens_text_fields_and_places_estimate_next_to_duration(app):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase"), Task(2, "Child", parent=1)])
+    dialog = TaskDialog(plan.tasks[0], plan)
+    dialog.show()
+    app.processEvents()
+    assert dialog.name.width() >= 500
+    assert dialog.resource.width() >= 500 and dialog.predecessors.width() >= 500
+    assert dialog.duration.parentWidget() is dialog.estimated.parentWidget() is dialog.duration_row
+    assert dialog.estimated.text() == "Estimated"
+    dialog.close()
+
+
+def test_completion_column_edits_tasks_and_rolls_up_summaries(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "progress.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase"),
+        Task(2, "Short", parent=1, duration=2, percent_complete=75),
+        Task(3, "Long", parent=1, duration=6, percent_complete=25)])
+    window.reset_history(saved=True)
+    window.refresh()
+    assert window.items[1].text(9) == "37.5%"
+    assert window.items[2].text(9) == "75.0%"
+    assert not window.can_edit_cell(window.plan.tasks[0], 9)
+    assert window.can_edit_cell(window.plan.tasks[1], 9)
+    window.edit_cell(2, 9, "100%")
+    assert window.plan.tasks[1].percent_complete == 100
+    assert window.items[1].text(9) == "43.8%"
+    window.undo()
+    assert window.items[1].text(9) == "37.5%" and not window.dirty
+    window.close()
+
+
+def test_completion_editor_and_task_dialog_percent_field(app, tmp_path):
+    window = MainWindow(QSettings(str(tmp_path / "completion-edit.ini"), QSettings.Format.IniFormat))
+    window.plan = Plan(start="2026-11-16", tasks=[Task(1, "Summary"), Task(2, "Leaf", parent=1, percent_complete=35)])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    window.tree.setCurrentItem(window.items[2], 9)
+    window.tree.editItem(window.items[2], 9)
+    app.processEvents()
+    editor = next(item for item in window.tree.findChildren(QDoubleSpinBox) if item.isVisible())
+    assert editor.value() == 35 and editor.suffix() == " %"
+    editor.setValue(80)
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    app.processEvents()
+    app.processEvents()
+    assert window.plan.tasks[1].percent_complete == 80 and window.items[1].text(9) == "80.0%"
+    dialog = TaskDialog(window.plan.tasks[0], window.plan)
+    assert dialog.percent_complete.value() == 80 and not dialog.percent_complete.isEnabled()
+    dialog = TaskDialog(window.plan.tasks[1], window.plan)
+    assert dialog.percent_complete.value() == 80 and dialog.percent_complete.isEnabled()
+    window.dirty = False
+    window.close()
+
+
+def test_collapsed_summary_toggle_and_progress_gantt_overlays(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "summary-colors.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "SIT Phase"), Task(2, "Almost complete", parent=1, duration=4, percent_complete=50),
+        Task(3, "Other", duration=2), Task(4, "SIT Phase 2"), Task(5, "Child", parent=4, duration=2)])
+    window.reset_history(saved=True)
+    window.show()
+    window.refresh()
+    calls = []
+    draw_summary = window.gantt.draw_summary_bar
+    draw_progress = window.gantt.draw_completion
+    def summary_spy(painter, item, y, name, expanded, progress, custom_color=""):
+        calls.append((name, expanded, progress, custom_color))
+        return draw_summary(painter, item, y, name, expanded, progress, custom_color)
+    progress_calls = []
+    def progress_spy(painter, item, y, percent, summary=False):
+        progress_calls.append((percent, summary))
+        return draw_progress(painter, item, y, percent, summary)
+    monkeypatch.setattr(window.gantt, "draw_summary_bar", summary_spy)
+    monkeypatch.setattr(window.gantt, "draw_completion", progress_spy)
+    window.items[1].setExpanded(False)
+    window.items[4].setExpanded(False)
+    window.gantt.grab()
+    assert calls == [("SIT Phase", False, 50, ""), ("SIT Phase 2", False, 0, "")]
+    assert (50, True) in progress_calls
+    assert window.color_collapsed_summaries
+    assert collapsed_summary_color("SIT Phase", False) == "#72a9e0"
+    assert collapsed_summary_color("SIT Phase", True) == collapsed_summary_color("SIT Phase 2", True)
+    assert collapsed_summary_color("SIT Phase", False, "#ff0000") == "#ff0000"
+    calls.clear()
+    window.items[1].setExpanded(True)
+    window.gantt.grab()
+    assert calls[0][1] is True
+    def disable_colors(dialog):
+        assert dialog.color_collapsed_summaries.isChecked()
+        dialog.color_collapsed_summaries.setChecked(False)
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", disable_colors)
+    window.settings()
+    assert not window.color_collapsed_summaries
+    assert preferences.value("display/color_collapsed_summaries", True, type=bool) is False
+    window.dirty = False
+    window.close()
+
+
+def test_summary_color_setting_is_enabled_by_default_and_persistent(app, tmp_path):
+    assert len(SUMMARY_PALETTE) == 16
+    assert summary_color("SIT Phase") == summary_color("sit phase 2")
+    assert summary_color("Café phase") == summary_color("Cafe phase")
+    assert summary_color("café phase") in SUMMARY_PALETTE
+    path = str(tmp_path / "summary-color.ini")
+    window = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert window.color_collapsed_summaries
+    dialog = SettingsDialog(window.plan, window, color_collapsed_summaries=True)
+    assert dialog.color_collapsed_summaries.isChecked()
+    dialog.color_collapsed_summaries.setChecked(False)
+    dialog.accept()
+    window.color_collapsed_summaries = dialog.color_collapsed_summaries.isChecked()
+    window.preferences.setValue("display/color_collapsed_summaries", window.color_collapsed_summaries)
+    reopened = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+    assert not reopened.color_collapsed_summaries
+    reopened.close()
     window.close()
 
 
@@ -550,6 +721,7 @@ def test_default_columns_fit_requested_content(app, tmp_path):
     expected_date = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
     assert window.tree.columnWidth(3) == window.tree.columnWidth(4) == expected_date
     assert window.tree.columnWidth(7) == max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
+    assert window.tree.columnWidth(9) >= header_metrics.horizontalAdvance("Complete")
 
 
 def test_task_column_widths_persist_across_processes_and_projects(app, tmp_path):
@@ -562,7 +734,7 @@ def test_task_column_widths_persist_across_processes_and_projects(app, tmp_path)
     window.refresh()
     app.processEvents()
     assert not any(preferences.contains(f"{COLUMN_WIDTH_KEY}/{key}") for key in TASK_COLUMN_KEYS)
-    widths = [60, 330, 110, 125, 140, 170, 160, 85, 115]
+    widths = [60, 330, 110, 125, 140, 170, 160, 85, 115, 90]
     for column, width in enumerate(widths):
         window.tree.setColumnWidth(column, width)
     assert window._column_width_sync.isActive()

@@ -48,7 +48,8 @@ def put_rows(window, selection, cut=False):
                    {task.uid: task for task in window.plan.tasks}, cut)
     mime = QMimeData()
     mime.setData(MIME, payload.token.encode("ascii"))
-    mime.setText("\n".join("\t".join(window.items[task.uid].text(col) for col in range(9)) for task in tasks))
+    mime.setText("\n".join("\t".join(window.items[task.uid].text(col)
+                                   for col in range(window.tree.columnCount())) for task in tasks))
     _payload = payload
     QApplication.clipboard().setMimeData(mime)
     return True
