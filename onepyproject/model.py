@@ -14,6 +14,15 @@ import tempfile
 from .dependencies import lag_minutes, parse_dependency, task_numbers
 
 
+# "duration": duration is the input and work is derived. "work": work is the input and
+# duration is derived. "units": resource units are held, so either duration or work may
+# be edited and the other recalculated. The scheduler itself always works from the
+# stored duration for "duration" and "units"; the difference is how edits propagate.
+MODES = ("duration", "work", "units")
+MODE_LABELS = {"duration": "Duration", "work": "Work", "units": "Units"}
+MODE_NAMES = {"duration": "Fixed duration", "work": "Fixed work", "units": "Fixed units"}
+
+
 @dataclass
 class Resource:
     uid: int
@@ -62,6 +71,13 @@ class Scheduled:
     duration: float
     work: float
     summary: bool = False
+
+
+def total_units(task: Task) -> float:
+    """Total allocation as a percentage, from assignments or the legacy single resource."""
+    if task.resource.strip():
+        return task.units
+    return sum(assignment.units for assignment in task.assignments)
 
 
 def estimated_tasks(plan: Plan) -> dict[int, bool]:
@@ -196,8 +212,11 @@ def work_between(start: datetime, finish: datetime, holidays: set[date]) -> floa
 def schedule(plan: Plan) -> dict[int, Scheduled]:
     """Schedule leaf tasks and roll up summaries using the project calendar.
 
-    Dates are local wall-clock times. Summary dependencies and resource leveling
-    are intentionally unsupported rather than approximated silently.
+    Dates are local wall-clock times. A summary task may be the predecessor of any
+    link type, using its rolled-up dates. A link *to* a summary task (FS or SS only)
+    is a start floor on every leaf beneath it, so the summary's own start follows
+    from its children. Finish-based links to a summary and resource leveling are
+    intentionally unsupported rather than approximated silently.
     """
     project_start = datetime.combine(date.fromisoformat(plan.start), time(8))
     holidays = {date.fromisoformat(value) for value in plan.holidays}
@@ -234,7 +253,7 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
             stack.clear()
         children.setdefault(task.parent, []).append(task.uid)
         stack.append(task.uid)
-        if task.mode not in ("duration", "work"):
+        if task.mode not in MODES:
             raise ValueError(f"Task {number}: invalid scheduling mode")
         if not all(math.isfinite(x) for x in (task.duration, task.work, task.units)):
             raise ValueError(f"Task {number}: numbers must be finite")
@@ -278,16 +297,19 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
         task = tasks[uid]
         number = numbers[uid]
         if uid in children:
-            if task.predecessors:
-                raise ValueError(f"Task {number}: summary dependencies are not supported")
+            for pred in task.predecessors:
+                link = parse_dependency(pred)
+                if link.uid not in tasks:
+                    raise ValueError(f"Task {number}: predecessor internal ID {link.uid} does not exist")
+                if link.kind not in ("FS", "SS"):
+                    raise ValueError(f"Task {number}: a summary task supports only FS and SS dependencies, "
+                                     f"not {link.kind}")
             kids = [calculate(child) for child in children[uid]]
             start, finish = min(c.start for c in kids), max(c.finish for c in kids)
             item = Scheduled(start, finish, work_between(start, finish, holidays) / 480,
                              sum(c.work for c in kids), True)
         else:
-            units = sum(assignment.units for assignment in task.assignments)
-            if task.resource.strip():
-                units = task.units
+            units = total_units(task)
             if not math.isfinite(units):
                 raise ValueError(f"Task {number}: total resource allocation is too large")
             rate = 8 * units / 100
@@ -299,12 +321,16 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
                 raise ValueError(f"Task {number}: calculated duration or work is too large")
             start = max(project_start, datetime.combine(date.fromisoformat(task.earliest), time(8)) if task.earliest else project_start)
             finish_bound = None
-            for pred in task.predecessors:
-                link = parse_dependency(pred)
+            # Links on enclosing summary tasks floor this task's start (FS/SS only,
+            # which the summary branch has validated).
+            links = [(number, parse_dependency(pred)) for pred in task.predecessors]
+            ancestor = task.parent
+            while ancestor:
+                links += [(numbers[ancestor], parse_dependency(pred)) for pred in tasks[ancestor].predecessors]
+                ancestor = tasks[ancestor].parent
+            for owner, link in links:
                 if link.uid not in tasks:
-                    raise ValueError(f"Task {number}: predecessor internal ID {link.uid} does not exist")
-                if link.uid in children:
-                    raise ValueError(f"Task {number}: summary predecessors are not supported")
+                    raise ValueError(f"Task {owner}: predecessor internal ID {link.uid} does not exist")
                 predecessor = calculate(link.uid)
                 minutes, elapsed = lag_minutes(link, predecessor.duration)
                 anchor = predecessor.finish if link.kind in ("FS", "FF") else predecessor.start

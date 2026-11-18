@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import Callable
 
-from .model import Plan, completion_percentages, estimated_tasks, schedule
+from .model import MODE_LABELS, Plan, completion_percentages, estimated_tasks, schedule
 from .dependencies import remap_predecessors, task_numbers
 from .resources import format_task_resources
 
@@ -58,7 +58,7 @@ def make_report(plan: Plan) -> Report:
             start=item.start, finish=item.finish,
             predecessors=", ".join(map(str, remap_predecessors(task.predecessors, numbers))),
             resources=format_task_resources(plan, task),
-            work=f"{item.work:g} h", mode="Work" if task.mode == "work" else "Duration",
+            work=f"{item.work:g} h", mode=MODE_LABELS[task.mode],
             summary=item.summary, percent_complete=f"{progress[task.uid]:.1f}%",
         ))
     return Report(plan.title, plan.start, tuple(rows),

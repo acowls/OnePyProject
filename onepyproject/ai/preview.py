@@ -5,7 +5,7 @@ import copy
 from dataclasses import dataclass
 
 from ..dependencies import remap_predecessors, task_numbers
-from ..model import Plan, Scheduled, completion_percentages, estimated_tasks, schedule
+from ..model import MODE_LABELS, Plan, Scheduled, completion_percentages, estimated_tasks, schedule
 from ..resources import format_task_resources
 from .diff import PlanDiff, compare_plans
 
@@ -58,7 +58,7 @@ def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
         return (str(numbers[task.uid]), task.name, f"{calculated.duration:g} d{'?' if estimates[task.uid] else ''}",
                 format_date(calculated.start, include_time=timed), format_date(calculated.finish, include_time=timed),
                 ", ".join(map(str, remap_predecessors(task.predecessors, numbers))),
-                format_task_resources(plan, task), f"{calculated.work:g} h", "Work" if task.mode == "work" else "Duration",
+                format_task_resources(plan, task), f"{calculated.work:g} h", MODE_LABELS[task.mode],
                 f"{progress[task.uid]:.1f}%")
 
     children = {0: []}

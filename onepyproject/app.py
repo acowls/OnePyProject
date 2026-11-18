@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QColo
 from PySide6.QtCore import QPointF
 
 from . import __version__
-from .model import (Plan, Task, completion_percentages, descendants, estimated_tasks, indent, load_plan,
-                    outdent, save_plan, schedule)
+from .model import (MODE_LABELS, MODE_NAMES, MODES, Plan, Task, completion_percentages, descendants,
+                    estimated_tasks, indent, load_plan, outdent, save_plan, schedule, total_units)
 from .dependencies import parse_dependency, parse_display_predecessors, remap_predecessors, task_numbers
 from .icons import toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
@@ -314,8 +314,8 @@ class TaskDelegate(QStyledItemDelegate):
             return None
         if index.column() == 8:
             editor = QComboBox(parent)
-            editor.addItem("Duration", "duration")
-            editor.addItem("Work", "work")
+            for mode in MODES:
+                editor.addItem(MODE_LABELS[mode], mode)
             editor.setAccessibleName("Task scheduling mode")
             arrow = (Path(__file__).resolve().parent / "assets" / "ui" / "tree_open.svg").as_posix().replace('"', '\\"')
             # The native macOS combo is taller than dense rows and paints
@@ -424,7 +424,8 @@ class TaskDialog(QDialog):
         calculated = schedule(plan).get(task.uid) if any(other.uid == task.uid for other in plan.tasks) else None
         self.display_duration = calculated.duration if calculated and task.mode == "work" else task.duration
         has_resources = bool(task.resource.strip() or task.assignments)
-        self.display_work = calculated.work if calculated and task.mode == "duration" and has_resources else task.work
+        self.display_work = (calculated.work if calculated and task.mode in ("duration", "units") and has_resources
+                             else task.work)
         self.duration_changed = False
         self.work_changed = False
         layout = QVBoxLayout(self)
@@ -436,9 +437,9 @@ class TaskDialog(QDialog):
         self.earliest = QLineEdit(task.earliest)
         self.earliest.setPlaceholderText("YYYY-MM-DD; blank uses project start")
         self.mode = QComboBox()
-        self.mode.addItem("Fixed duration", "duration")
-        self.mode.addItem("Fixed work", "work")
-        self.mode.setCurrentIndex(1 if task.mode == "work" else 0)
+        for mode in MODES:
+            self.mode.addItem(MODE_NAMES[mode], mode)
+        self.mode.setCurrentIndex(self.mode.findData(task.mode))
         self.duration = QDoubleSpinBox()
         self.duration.setRange(0, 100000)
         self.duration.setDecimals(2)
@@ -514,7 +515,8 @@ class TaskDialog(QDialog):
             form.addRow(label, widget)
         if self.summary:
             form.addRow("Summary bar", color_row)
-        hint = QLabel("A duration or work of 0 creates a milestone. Summary dates are calculated from children.")
+        hint = QLabel("A duration or work of 0 creates a milestone. Summary dates are calculated from children. "
+                      "Fixed units: edit duration or work and the other is recalculated; if you edit both, duration wins.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -528,19 +530,25 @@ class TaskDialog(QDialog):
         task.mode = self.mode.currentData()
         if self.duration_changed:
             task.duration = self.duration.value()
-        elif self.initial_mode == "work" and task.mode == "duration":
+        elif self.initial_mode == "work" and task.mode != "work":
             task.duration = self.display_duration
         task.estimated = self.estimated.isChecked()
         if not self.summary and self.percent_changed:
             task.percent_complete = self.percent_complete.value()
         if self.work_changed:
             task.work = self.work.value()
-        elif self.initial_mode == "duration" and task.mode == "work":
+        elif self.initial_mode != "work" and task.mode == "work":
             task.work = self.display_work
         if not self.summary:
             set_task_resources(plan, task, self.resource.text())
         else:
             task.summary_color = self.summary_color_value
+        if task.mode == "units" and self.work_changed and not self.duration_changed and total_units(task) > 0:
+            # Fixed units: units stay put, so editing only the work changes the duration.
+            days = task.work / (8 * total_units(task) / 100)
+            if not math.isfinite(days) or days > 100000:
+                raise ValueError("Duration cannot exceed 100,000 days")
+            task.duration = days
         if self.predecessors.text() != self.original_predecessors:
             task.predecessors = parse_display_predecessors(self.predecessors.text(), plan.tasks)
 
@@ -1461,7 +1469,7 @@ class MainWindow(QMainWindow):
             values = [str(numbers[task.uid]), task.name, f"{item.duration:g} d{'?' if estimates[task.uid] else ''}",
                       start, finish,
                       ", ".join(map(str, remap_predecessors(task.predecessors, numbers))), format_task_resources(self.plan, task),
-                      f"{item.work:g} h", "Work" if task.mode == "work" else "Duration",
+                      f"{item.work:g} h", MODE_LABELS[task.mode],
                       f"{progress[task.uid]:.1f}%"]
             node = QTreeWidgetItem(values)
             node.setData(0, Qt.ItemDataRole.UserRole, task.uid)
@@ -1469,7 +1477,11 @@ class MainWindow(QMainWindow):
             node.setToolTip(2, "A question mark indicates an estimated duration.")
             node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
             node.setToolTip(4, display_time(item.finish, self.date_format))
-            node.setToolTip(5, "Use displayed task IDs: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas.")
+            node.setToolTip(5, "Use displayed task IDs: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas."
+                               + (" A summary task supports only FS and SS links, which apply to every subtask."
+                                  if item.summary else ""))
+            node.setToolTip(8, "Duration: duration is entered, work is calculated. Work: work is entered, duration is "
+                               "calculated. Units: either may be entered and the other is recalculated.")
             node.setToolTip(9, "Task completion is user-entered; summary completion is weighted by child work.")
             if item.summary and (task.assignments or task.resource.strip()):
                 node.setToolTip(6, "Summary resources are retained but not included in scheduling or MPP export.")
@@ -1691,17 +1703,18 @@ class MainWindow(QMainWindow):
         self.refresh(selected)
 
     def can_edit_cell(self, task, column):
-        if column == 1:
+        if column in (1, 5):
             return True
         if self.calculated[task.uid].summary:
             return False
         if column == 9:
             return True
         if column == 2:
-            return task.mode == "duration"
+            return task.mode in ("duration", "units")
         if column == 7:
-            return task.mode == "work"
-        return column in (3, 5, 6, 8)
+            # Fixed units can derive duration from work only when something is assigned.
+            return task.mode == "work" or (task.mode == "units" and total_units(task) > 0)
+        return column in (3, 6, 8)
 
     def edit_cell(self, uid, column, value):
         task = next((t for t in self.plan.tasks if t.uid == uid), None)
@@ -1732,15 +1745,25 @@ class MainWindow(QMainWindow):
             elif column == 6:
                 set_task_resources(self.plan, task, text)
             elif column == 7:
-                task.work = float(text.removesuffix("hours").removesuffix("hour").removesuffix("h").strip())
-                if task.work > 800000:
+                work = float(text.removesuffix("hours").removesuffix("hour").removesuffix("h").strip())
+                if work > 800000:
                     raise ValueError("Work cannot exceed 800,000 hours")
+                if task.mode == "units":
+                    # Fixed units: units stay put, so changing work changes the duration.
+                    days = work / (8 * total_units(task) / 100)
+                    if not math.isfinite(days) or days > 100000:
+                        raise ValueError("Duration cannot exceed 100,000 days")
+                    task.duration = days
+                else:
+                    task.work = work
             elif column == 8:
+                if text not in MODES:
+                    raise ValueError(f"Scheduling mode must be one of: {', '.join(MODES)}")
                 if text == "work" and task.mode != "work":
                     if not (task.resource.strip() or task.assignments):
                         raise ValueError("Assign a resource before switching to fixed work")
                     task.work = self.calculated[uid].work
-                elif text == "duration" and task.mode != "duration":
+                elif text != "work" and task.mode == "work":
                     task.duration = self.calculated[uid].duration
                 task.mode = text
             elif column == 9:

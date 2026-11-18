@@ -250,3 +250,97 @@ def test_mpp_import_does_not_guess_unknown_lag_units(tmp_path, monkeypatch):
     imported, notes = import_mpp(output)
     assert not imported.tasks[1].predecessors
     assert any("unsupported MPP" in note for note in notes)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_fixed_units_and_summary_links_survive_an_export_and_import(tmp_path):
+    plan = Plan(title="Round trip", start="2026-11-16", resources=[Resource(1, "Ada", 100)], tasks=[
+        Task(1, "Lead in", duration=3, mode="units", assignments=[ResourceAssignment(1, 100)]),
+        Task(2, "Phase", predecessors=[1]),
+        Task(3, "First", parent=2, duration=2),
+        Task(4, "Second", parent=2, duration=1, mode="work", work=8, assignments=[ResourceAssignment(1, 100)],
+             predecessors=[3]),
+        Task(5, "Follow-on", duration=1, predecessors=["2FS+1d"]),
+    ])
+    output = tmp_path / "units-and-summary-links.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [(t.uid, t.mode) for t in imported.tasks] == [(1, "units"), (2, "duration"), (3, "duration"),
+                                                         (4, "work"), (5, "duration")]
+    assert imported.tasks[1].predecessors == [1]                 # a link *to* a summary
+    assert [parse_dependency(p).uid for p in imported.tasks[4].predecessors] == [2]   # a link *from* a summary
+    assert not [note for note in notes if "omitted" in note or "fixed-units" in note]
+
+
+def test_export_hands_pymppwriter_summary_links_and_task_types(tmp_path, monkeypatch):
+    """No template needed: capture what export gives pymppwriter and run its own validation."""
+    from onepyproject import mpp
+    from pymppwriter.writer import effective_schedule, validate
+
+    captured = {}
+
+    class CapturingWriter:
+        def __init__(self, template):
+            pass
+
+        def write(self, project, destination):
+            validate(project)                  # structure, outline and cycle checks
+            effective_schedule(project)        # summary rows are rolled up, so summary links resolve
+            captured["project"] = project
+            Path(destination).write_bytes(b"")
+
+    monkeypatch.setattr(mpp, "MppWriter", CapturingWriter)
+    monkeypatch.setattr(mpp, "strip_template_resources", lambda writer: None)
+    template = tmp_path / "empty-template.mpp"
+    template.write_bytes(b"")
+    plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada", 100)], tasks=[
+        Task(1, "Lead in", duration=3, mode="units", assignments=[ResourceAssignment(1, 100)]),
+        Task(2, "Phase", predecessors=["1"]),
+        Task(3, "First", parent=2, duration=2),
+        Task(4, "Second", parent=2, duration=1, mode="work", work=8, assignments=[ResourceAssignment(1, 100)],
+             predecessors=[3]),
+        Task(5, "Follow-on", duration=1, predecessors=["2FS+1d"]),
+    ])
+    export_mpp(plan, template, tmp_path / "out.mpp")
+    project = captured["project"]
+    assert [t.task_type for t in project.tasks] == ["fixed_units", "fixed_duration", "fixed_duration",
+                                                    "fixed_work", "fixed_duration"]
+    assert [(r.pred_uid, r.succ_uid, r.type, r.lag_days) for r in project.relations] == [
+        (1, 2, "FS", 0.0), (3, 4, "FS", 0.0), (2, 5, "FS", 1.0)]
+
+
+def test_import_keeps_summary_links_maps_fixed_units_and_reports_what_it_drops(tmp_path, monkeypatch):
+    """Importer mapping on stand-in source data, so no MPP file is needed."""
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    def task(uid, name, start, days, parent=0):
+        return NS(uid=uid, name=name, parent_uid=parent, start=datetime.fromisoformat(start),
+                  duration_days=days, estimated=False, percent_complete=0)
+
+    def link(pred, succ, kind):
+        return NS(pred_uid=pred, succ_uid=succ, type=kind)
+
+    source = NS(title="Stand-in", start=datetime(2026, 11, 16, 8), resources=[], assignments=[], tasks=[
+        task(1, "Lead in", "2026-11-16", 3), task(2, "Phase", "2026-11-17", 1),
+        task(3, "First", "2026-11-17", 1, parent=2), task(4, "Second", "2026-11-20", 1, parent=2),
+        task(5, "After", "2026-11-24", 1), task(6, "Side", "2026-11-16", 1),
+    ], relations=[link(1, 2, "FS"), link(2, 5, "FS"), link(6, 2, "FF"), link(99, 3, "FS")])
+    records = [(1, 2, 1, 7, 0), (2, 5, 1, 7, 0), (6, 2, 0, 7, 0), (99, 3, 1, 7, 0)]
+    types = {1: (0, 24.0), 3: (0, 8.0), 4: (0, 8.0), 5: (1, 8.0), 6: (0, 8.0)}
+    monkeypatch.setattr(mpp, "read_project", lambda path: source)
+    monkeypatch.setattr(mpp, "_mpp_resource_values", lambda path: ({}, []))
+    monkeypatch.setattr(mpp, "_mpp_task_work", lambda path: types)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: records)
+
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert [(t.uid, t.mode) for t in plan.tasks] == [(1, "units"), (2, "duration"), (3, "units"),
+                                                     (4, "units"), (5, "duration"), (6, "units")]
+    assert plan.tasks[1].predecessors == [1]          # link to a summary is kept
+    assert plan.tasks[4].predecessors == [2]          # link from a summary is kept
+    assert notes == [
+        "Task 2: omitted FF dependency on task 6; a summary task supports only FS and SS links",
+        "Task 3: omitted dependency on missing task UID 99",
+        "Recalculation starts 1 tasks later than the MPP file; the first is Task 3 "
+        "(2026-11-17 became 2026-11-19). Check its predecessors and the project start date",
+    ]

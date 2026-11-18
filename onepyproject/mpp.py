@@ -16,7 +16,8 @@ from pymppwriter import Resource as MppResource
 from pymppwriter import Task as MppTask
 from pymppwriter import read_project
 
-from .model import Plan, Resource, ResourceAssignment, Task, completion_percentages, estimated_tasks, schedule
+from .model import (Plan, Resource, ResourceAssignment, Task, completion_percentages, estimated_tasks,
+                    schedule)
 from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency, task_numbers
 from .resources import migrate_legacy_resources
 from .mpp_template import strip_template_resources
@@ -29,6 +30,7 @@ IMPORT_WARNING = (
     "baselines, resource calendars, rates, timephased work, some lag units and other data may be lost. "
     "Keep the original MPP and verify the imported schedule."
 )
+EXPORT_TASK_TYPES = {"duration": "fixed_duration", "work": "fixed_work", "units": "fixed_units"}
 EXPORT_WARNING = (
     "An empty MPP template is required to save this project as an MPP. "
     "Some metadata may be retained from the template in the saved file.\n\n"
@@ -185,16 +187,20 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
                 mode = "work"
             else:
                 notes.append(f"Task {numbers[task.uid]}: fixed-work data could not be represented; imported as fixed-duration")
-        elif task.uid not in summary_ids and task_type == 0 and assns:
-            notes.append(f"Task {numbers[task.uid]}: fixed-units scheduling is approximated as fixed-duration")
+        elif task.uid not in summary_ids and task_type == 0:
+            # Fixed units keeps the stored duration and derives work from it, which is
+            # exactly what the file holds, so nothing is lost on import.
+            mode = "units"
         elif task.uid not in summary_ids and task_type not in (0, 1, 2) and assns:
             notes.append(f"Task {numbers[task.uid]}: unknown task type is approximated as fixed-duration")
         predecessors = []
         for pred in links.get(task.uid, []):
-            pred_uid = parse_dependency(pred).uid
-            if pred_uid not in ids or pred_uid in summary_ids or task.uid in summary_ids:
-                predecessor = numbers.get(pred_uid, f"UID {pred_uid}")
-                notes.append(f"Task {numbers[task.uid]}: omitted unsupported summary or missing predecessor {predecessor}")
+            link = parse_dependency(pred)
+            if link.uid not in ids:
+                notes.append(f"Task {numbers[task.uid]}: omitted dependency on missing task UID {link.uid}")
+            elif task.uid in summary_ids and link.kind not in ("FS", "SS"):
+                notes.append(f"Task {numbers[task.uid]}: omitted {link.kind} dependency on task "
+                             f"{numbers[link.uid]}; a summary task supports only FS and SS links")
             else:
                 predecessors.append(pred)
         tasks.append(Task(uid=task.uid, name=task.name or f"Task {numbers[task.uid]}", parent=task.parent_uid,
@@ -204,7 +210,18 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
                           percent_complete=getattr(task, "percent_complete", 0) or 0))
     plan = Plan(title=source.title or "Imported project", start=source.start.date().isoformat(),
                 tasks=tasks, resources=resources)
-    schedule(plan)  # Reject broken outlines or cycles rather than hiding them.
+    scheduled = schedule(plan)  # Reject broken outlines or cycles rather than hiding them.
+    # The recalculated plan can disagree with the dates Project stored, for example when a
+    # link is not satisfied in the file or the project start is later than some tasks.
+    # Say so once instead of letting the schedule move silently.
+    stored = {task.uid: task.start.date() for task in source.tasks}
+    later = [task for task in plan.tasks
+             if task.uid not in summary_ids and scheduled[task.uid].start.date() > stored[task.uid]]
+    if later:
+        first = later[0]
+        notes.append(f"Recalculation starts {len(later)} tasks later than the MPP file; the first is Task "
+                     f"{numbers[first.uid]} ({stored[first.uid]} became {scheduled[first.uid].start.date()}). "
+                     "Check its predecessors and the project start date")
     return plan, notes
 
 
@@ -237,7 +254,7 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
                                  duration_days=item.duration, outline_level=level, parent_uid=task.parent,
                                  estimated=estimates[task.uid],
                                  percent_complete=round(progress[task.uid]),
-                                 task_type="fixed_work" if task.mode == "work" else "fixed_duration",
+                                 task_type=EXPORT_TASK_TYPES[task.mode],
                                  effort_driven=task.mode == "work"))
         if item.summary and task.assignments:
             raise ValueError(f"Cannot export task {numbers[task.uid]}: summary resource assignments are not supported")

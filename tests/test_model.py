@@ -194,3 +194,88 @@ def test_dependency_plan_backward_compatibility(tmp_path):
     assert load_plan(path) == plan
     assert parse_predecessors("1, 2SS+3h") == [1, "2SS+3h"]
     assert parse_predecessors("2SF+5, 3FS-2") == ["2SF+5d", "3FS-2d"]
+
+
+def _summary_plan(*extra):
+    # Phase 1 spans Mon 16 Nov 08:00 to Fri 20 Nov 17:00: A takes two days, then B three.
+    return Plan(start="2026-11-16", tasks=[
+        Task(1, "Phase"), Task(2, "A", parent=1, duration=2), Task(3, "B", parent=1, duration=3, predecessors=[2]),
+        *extra])
+
+
+def test_summary_task_can_be_a_predecessor_using_its_rolled_up_dates():
+    items = schedule(_summary_plan(
+        Task(10, "After finish", duration=1, predecessors=[1]),
+        Task(11, "With start", duration=1, predecessors=["1SS"]),
+        Task(12, "With finish", duration=1, predecessors=["1FF"]),
+        Task(13, "Lagged", duration=1, predecessors=["1FS+1d"])))
+    assert (items[1].start, items[1].finish) == (datetime(2026, 11, 16, 8), datetime(2026, 11, 20, 17))
+    assert items[10].start == datetime(2026, 11, 23, 8)
+    assert items[11].start == datetime(2026, 11, 16, 8)
+    assert items[12].finish == datetime(2026, 11, 20, 17)
+    assert items[13].start == datetime(2026, 11, 24, 8)
+
+
+def test_link_to_a_summary_task_floors_every_subtask():
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Phase", predecessors=[1]), Task(3, "A", parent=2, duration=1),
+        Task(4, "B", parent=2, duration=2, predecessors=[3]),
+        Task(5, "Nested", parent=2), Task(6, "C", parent=5, duration=1),
+        Task(7, "Same-phase SS", duration=1, predecessors=[2]),
+    ])
+    items = schedule(plan)
+    assert items[1].finish == datetime(2026, 11, 18, 17)
+    # The link floors A and the nested leaf; B follows A as before.
+    assert items[3].start == datetime(2026, 11, 19, 8)
+    assert items[4].start == datetime(2026, 11, 20, 8)
+    assert items[6].start == datetime(2026, 11, 19, 8)
+    assert items[2].start == datetime(2026, 11, 19, 8) and items[2].finish == datetime(2026, 11, 23, 17)
+    assert items[7].start == datetime(2026, 11, 24, 8)
+
+    plan.tasks[1].predecessors = ["1SS+1d"]
+    items = schedule(plan)
+    assert items[3].start == items[6].start == datetime(2026, 11, 17, 8)
+
+
+def test_a_subtask_keeps_a_later_start_from_its_own_predecessor():
+    items = schedule(Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=1), Task(2, "Long", duration=5),
+        Task(3, "Phase", predecessors=[1]), Task(4, "A", parent=3, duration=1, predecessors=[2])]))
+    assert items[4].start == datetime(2026, 11, 23, 8)
+
+
+def test_summary_task_rejects_finish_links_unknown_ids_and_cycles():
+    with pytest.raises(ValueError, match="Task 2: a summary task supports only FS and SS"):
+        schedule(Plan(tasks=[Task(1, "Lead"), Task(2, "Phase", predecessors=["1FF"]), Task(3, "A", parent=2)]))
+    with pytest.raises(ValueError, match="Task 2: a summary task supports only FS and SS"):
+        schedule(Plan(tasks=[Task(1, "Lead"), Task(2, "Phase", predecessors=["1SF"]), Task(3, "A", parent=2)]))
+    with pytest.raises(ValueError, match="Task 1: predecessor internal ID 99 does not exist"):
+        schedule(Plan(tasks=[Task(1, "Phase", predecessors=[99]), Task(2, "A", parent=1)]))
+    # A subtask cannot depend on the summary that contains it.
+    with pytest.raises(ValueError, match="cycle"):
+        schedule(Plan(tasks=[Task(1, "Phase"), Task(2, "A", parent=1, predecessors=[1])]))
+    # Linking a summary to a task that depends on one of its subtasks is also a cycle.
+    with pytest.raises(ValueError, match="cycle"):
+        schedule(Plan(tasks=[Task(1, "Phase", predecessors=[3]), Task(2, "A", parent=1),
+                             Task(3, "Next", predecessors=[2])]))
+
+
+def test_summary_links_round_trip_through_a_saved_plan(tmp_path):
+    plan = _summary_plan(Task(10, "After", duration=1, predecessors=[1]))
+    plan.tasks[0].predecessors = []
+    plan.tasks.insert(0, Task(9, "Lead", duration=1))
+    plan.tasks[1].predecessors = [9]
+    path = tmp_path / "summary.pxplan"
+    save_plan(plan, path)
+    assert load_plan(path) == plan
+
+
+def test_fixed_units_schedules_from_the_stored_duration_and_derives_work():
+    items = schedule(Plan(start="2026-11-16", tasks=[
+        Task(1, "Units", mode="units", duration=5, resource="Team", units=200),
+        Task(2, "Units, nobody assigned", mode="units", duration=2)]))
+    assert items[1].duration == 5 and items[1].work == 80
+    assert items[2].duration == 2 and items[2].work == 0
+    with pytest.raises(ValueError, match="invalid scheduling mode"):
+        schedule(Plan(tasks=[Task(1, mode="effort")]))

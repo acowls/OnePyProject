@@ -1898,3 +1898,61 @@ def test_save_as_mpp_creates_copy_without_changing_working_save(app, tmp_path, m
     original = written.read_bytes()
     window.save_as()
     assert warnings and "does not overwrite" in warnings[-1] and written.read_bytes() == original
+
+
+def test_fixed_units_edits_recalculate_the_other_value(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Staffed", duration=2, resource="Alex"), Task(2, "Unstaffed", mode="units", duration=2)])
+    window.reset_history(saved=True)
+    window.refresh()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.edit_cell(1, 8, "units")
+    task = window.plan.tasks[0]
+    assert task.mode == "units" and window.items[1].text(8) == "Units"
+    assert window.can_edit_cell(task, 2) and window.can_edit_cell(task, 7)
+    window.edit_cell(1, 7, "24 h")                       # work drives duration
+    assert window.plan.tasks[0].duration == 3 and window.calculated[1].work == 24
+    window.edit_cell(1, 2, "4")                          # duration drives work
+    assert window.calculated[1].work == 32 and window.plan.tasks[0].mode == "units"
+    window.edit_cell(1, 8, "work")                       # keeps the calculated work
+    assert window.plan.tasks[0].work == 32
+    window.edit_cell(1, 8, "units")                      # and the calculated duration coming back
+    assert window.plan.tasks[0].duration == 4
+    # Nothing assigned, so work cannot determine a duration.
+    assert window.can_edit_cell(window.plan.tasks[1], 2) and not window.can_edit_cell(window.plan.tasks[1], 7)
+    window.edit_cell(1, 8, "nonsense")
+    assert errors and window.plan.tasks[0].mode == "units"
+
+
+def test_summary_predecessors_are_editable_and_finish_links_are_refused(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3), Task(2, "Phase"), Task(3, "Child", parent=2, duration=1)])
+    window.reset_history(saved=True)
+    window.refresh()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    assert window.can_edit_cell(window.plan.tasks[1], 5) and not window.can_edit_cell(window.plan.tasks[1], 2)
+    window.edit_cell(2, 5, "1")
+    assert window.plan.tasks[1].predecessors == [1]
+    assert window.calculated[3].start.date().isoformat() == "2026-11-19"
+    window.edit_cell(2, 5, "1FF")
+    assert errors and "FS and SS" in errors[-1] and window.plan.tasks[1].predecessors == [1]
+
+
+def test_task_dialog_offers_fixed_units_and_work_edit_changes_duration(app):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Staffed", mode="units", duration=2, resource="Alex")])
+    dialog = TaskDialog(plan.tasks[0], plan)
+    assert [dialog.mode.itemData(i) for i in range(dialog.mode.count())] == ["duration", "work", "units"]
+    assert dialog.mode.currentData() == "units" and dialog.work.value() == 16
+    dialog.work.setValue(40)
+    dialog.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].mode == "units" and plan.tasks[0].duration == 5
+    # Editing both fields keeps the duration that was typed.
+    again = TaskDialog(plan.tasks[0], plan)
+    again.duration.setValue(2)
+    again.work.setValue(80)
+    again.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].duration == 2
