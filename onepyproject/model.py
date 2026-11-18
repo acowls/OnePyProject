@@ -1,6 +1,7 @@
 """Project model and intentionally limited, deterministic scheduling rules."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 import copy
 from datetime import date, datetime, time, timedelta
@@ -21,6 +22,14 @@ from .dependencies import lag_minutes, parse_dependency, task_numbers
 MODES = ("duration", "work", "units")
 MODE_LABELS = {"duration": "Duration", "work": "Work", "units": "Units"}
 MODE_NAMES = {"duration": "Fixed duration", "work": "Fixed work", "units": "Fixed units"}
+
+# How a task's start date is held. "no_earlier" is a floor: predecessors may move the task
+# later (Project's "Start No Earlier Than"). "fixed" pins the task: its predecessors never
+# move it, although it still drives its own successors. That is how Project treats a task
+# that has already started, or one pinned with a Must Start On constraint or manual
+# scheduling. The date is stored in Task.earliest for both.
+START_MODES = ("no_earlier", "fixed")
+START_MODE_LABELS = {"no_earlier": "No earlier than", "fixed": "Fixed"}
 
 
 @dataclass
@@ -53,6 +62,7 @@ class Task:
     assignments: list[ResourceAssignment] = field(default_factory=list)
     percent_complete: float = 0.0
     summary_color: str = ""
+    start_mode: str = "no_earlier"
 
 
 @dataclass
@@ -209,7 +219,70 @@ def work_between(start: datetime, finish: datetime, holidays: set[date]) -> floa
     return result
 
 
-def schedule(plan: Plan) -> dict[int, Scheduled]:
+def _place_leaf(floor: datetime, start_bound: datetime | None, finish_bound: datetime | None,
+                duration: float, holidays: set[date], number: int) -> tuple[datetime, datetime]:
+    """Start and finish of a leaf: the latest of its floor and link bounds, on working time."""
+    start = floor
+    if start_bound is not None:
+        start = max(start, start_bound)
+    if not duration and finish_bound is not None:
+        start = max(start, finish_bound)
+    if duration > 0:
+        start = next_start(start, holidays)
+    else:
+        start = milestone_at_or_after(start, holidays)
+    finish = add_work(start, duration * 480, holidays)
+    if duration > 0 and finish_bound is not None and finish < finish_bound:
+        # For FF/SF, find the earliest start whose working-time finish
+        # meets the finish constraint. Off-hours cannot be a work finish.
+        candidate = subtract_work(finish_bound, duration * 480, holidays)
+        start = next_start(max(start, candidate), holidays)
+        finish = add_work(start, duration * 480, holidays)
+        if finish < finish_bound:
+            # A finish constraint in a non-working gap, or exactly at
+            # a work-period start, needs the next representable tick.
+            target = next_start(finish_bound, holidays) + timedelta(seconds=6)
+            candidate = subtract_work(target, duration * 480, holidays)
+            start = next_start(max(start, candidate), holidays)
+            finish = add_work(start, duration * 480, holidays)
+        if finish < finish_bound:
+            raise ValueError(f"Task {number}: cannot satisfy finish dependency")
+    return start, finish
+
+
+def _leaf_links(task: Task, tasks: dict[int, Task], numbers: dict[int, int]) -> list:
+    """A leaf's own links plus those on enclosing summaries, as (task number, link) pairs.
+
+    Links on enclosing summary tasks floor the leaf's start (FS/SS only, which the summary
+    branch of ``schedule`` has validated).
+    """
+    links = [(numbers[task.uid], parse_dependency(pred)) for pred in task.predecessors]
+    ancestor = task.parent
+    while ancestor:
+        links += [(numbers[ancestor], parse_dependency(pred)) for pred in tasks[ancestor].predecessors]
+        ancestor = tasks[ancestor].parent
+    return links
+
+
+def _link_bounds(links: list, get: Callable[[int], Scheduled], tasks: dict[int, Task],
+                 holidays: set[date]) -> tuple[datetime | None, datetime | None]:
+    """The latest start and finish that a leaf's links impose; ``get`` places a predecessor."""
+    start_bound = finish_bound = None
+    for owner, link in links:
+        if link.uid not in tasks:
+            raise ValueError(f"Task {owner}: predecessor internal ID {link.uid} does not exist")
+        predecessor = get(link.uid)
+        minutes, elapsed = lag_minutes(link, predecessor.duration)
+        anchor = predecessor.finish if link.kind in ("FS", "FF") else predecessor.start
+        bound = offset_time(anchor, minutes, elapsed, holidays)
+        if link.kind in ("FS", "SS"):
+            start_bound = bound if start_bound is None else max(start_bound, bound)
+        else:
+            finish_bound = bound if finish_bound is None else max(finish_bound, bound)
+    return start_bound, finish_bound
+
+
+def schedule(plan: Plan, *, on_leaf: Callable[[Task, datetime], None] | None = None) -> dict[int, Scheduled]:
     """Schedule leaf tasks and roll up summaries using the project calendar.
 
     Dates are local wall-clock times. A summary task may be the predecessor of any
@@ -217,6 +290,14 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
     is a start floor on every leaf beneath it, so the summary's own start follows
     from its children. Finish-based links to a summary and resource leveling are
     intentionally unsupported rather than approximated silently.
+
+    A leaf with start_mode "fixed" starts on its stored date whatever its predecessors
+    say, and still drives its successors. Its links are validated and kept.
+
+    ``on_leaf`` is called once per leaf, after its predecessors are placed and before its
+    own start hint is applied, with the start its links alone would give. It may change
+    the task's ``start_mode`` and ``earliest``; the change takes effect immediately. The
+    MPP importer uses this to choose a hint for each task in a single pass.
     """
     project_start = datetime.combine(date.fromisoformat(plan.start), time(8))
     holidays = {date.fromisoformat(value) for value in plan.holidays}
@@ -279,8 +360,12 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
                 raise ValueError(f"Task {number}: resource allocation must be positive")
         if task.mode == "work" and not (task.resource.strip() or task.assignments):
             raise ValueError(f"Task {number}: fixed work needs a resource")
+        if task.start_mode not in START_MODES:
+            raise ValueError(f"Task {number}: invalid start type")
         if task.earliest:
             date.fromisoformat(task.earliest)
+        if task.start_mode == "fixed" and not task.earliest:
+            raise ValueError(f"Task {number}: a fixed start needs a date")
         dependencies = [parse_dependency(pred) for pred in task.predecessors]
         if len({link.uid for link in dependencies}) != len(dependencies):
             raise ValueError(f"Task {number}: duplicate predecessors are not supported")
@@ -319,48 +404,25 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
             work = task.work if task.mode == "work" else duration * 8 * units / 100
             if not math.isfinite(duration) or not math.isfinite(work):
                 raise ValueError(f"Task {number}: calculated duration or work is too large")
-            start = max(project_start, datetime.combine(date.fromisoformat(task.earliest), time(8)) if task.earliest else project_start)
-            finish_bound = None
-            # Links on enclosing summary tasks floor this task's start (FS/SS only,
-            # which the summary branch has validated).
-            links = [(number, parse_dependency(pred)) for pred in task.predecessors]
-            ancestor = task.parent
-            while ancestor:
-                links += [(numbers[ancestor], parse_dependency(pred)) for pred in tasks[ancestor].predecessors]
-                ancestor = tasks[ancestor].parent
-            for owner, link in links:
-                if link.uid not in tasks:
-                    raise ValueError(f"Task {owner}: predecessor internal ID {link.uid} does not exist")
-                predecessor = calculate(link.uid)
-                minutes, elapsed = lag_minutes(link, predecessor.duration)
-                anchor = predecessor.finish if link.kind in ("FS", "FF") else predecessor.start
-                bound = offset_time(anchor, minutes, elapsed, holidays)
-                if link.kind in ("FS", "SS"):
-                    start = max(start, bound)
-                else:
-                    finish_bound = max(finish_bound, bound) if finish_bound else bound
-            if not duration and finish_bound:
-                start = max(start, finish_bound)
-            if duration > 0:
-                start = next_start(start, holidays)
+            # Every link is resolved even for a fixed task, so missing predecessors and
+            # cycles are still reported; a fixed task just ignores the resulting bounds.
+            start_bound, finish_bound = _link_bounds(_leaf_links(task, tasks, numbers), calculate, tasks, holidays)
+            if on_leaf is not None:
+                try:
+                    free, _ = _place_leaf(project_start, start_bound, finish_bound, duration, holidays, number)
+                except ValueError:
+                    if task.start_mode != "fixed":
+                        raise
+                    free = None  # A fixed task need not satisfy its finish links.
+                if free is not None:
+                    on_leaf(task, free)
+            floor = project_start
+            if task.earliest:
+                floor = max(project_start, datetime.combine(date.fromisoformat(task.earliest), time(8)))
+            if task.start_mode == "fixed":
+                start, finish = _place_leaf(floor, None, None, duration, holidays, number)
             else:
-                start = milestone_at_or_after(start, holidays)
-            finish = add_work(start, duration * 480, holidays)
-            if duration > 0 and finish_bound and finish < finish_bound:
-                # For FF/SF, find the earliest start whose working-time finish
-                # meets the finish constraint. Off-hours cannot be a work finish.
-                candidate = subtract_work(finish_bound, duration * 480, holidays)
-                start = next_start(max(start, candidate), holidays)
-                finish = add_work(start, duration * 480, holidays)
-                if finish < finish_bound:
-                    # A finish constraint in a non-working gap, or exactly at
-                    # a work-period start, needs the next representable tick.
-                    target = next_start(finish_bound, holidays) + timedelta(seconds=6)
-                    candidate = subtract_work(target, duration * 480, holidays)
-                    start = next_start(max(start, candidate), holidays)
-                    finish = add_work(start, duration * 480, holidays)
-                if finish < finish_bound:
-                    raise ValueError(f"Task {number}: cannot satisfy finish dependency")
+                start, finish = _place_leaf(floor, start_bound, finish_bound, duration, holidays, number)
             item = Scheduled(start, finish, duration, work)
         result[uid] = item
         visiting.remove(uid)
@@ -369,6 +431,35 @@ def schedule(plan: Plan) -> dict[int, Scheduled]:
     for task in plan.tasks:
         calculate(task.uid)
     return result
+
+
+def start_conflicts(plan: Plan, calculated: dict[int, Scheduled] | None = None) -> dict[int, datetime]:
+    """Fixed tasks that start before their predecessors allow.
+
+    Returns each such task's uid with the start its links alone would give. The link is
+    kept and the task stays where it is fixed, so this is a warning and not an error. Pass
+    ``calculated`` from ``schedule(plan)`` to avoid scheduling again.
+    """
+    calculated = calculated if calculated is not None else schedule(plan)
+    tasks = {task.uid: task for task in plan.tasks}
+    numbers = task_numbers(plan.tasks)
+    summaries = {task.parent for task in plan.tasks if task.parent}
+    project_start = datetime.combine(date.fromisoformat(plan.start), time(8))
+    holidays = {date.fromisoformat(value) for value in plan.holidays}
+    found: dict[int, datetime] = {}
+    for task in plan.tasks:
+        if task.start_mode != "fixed" or task.uid in summaries:
+            continue
+        start_bound, finish_bound = _link_bounds(_leaf_links(task, tasks, numbers), calculated.__getitem__,
+                                                 tasks, holidays)
+        try:
+            free, _ = _place_leaf(project_start, start_bound, finish_bound, calculated[task.uid].duration,
+                                  holidays, numbers[task.uid])
+        except ValueError:
+            continue  # A fixed task need not satisfy its finish links.
+        if free.date() > calculated[task.uid].start.date():
+            found[task.uid] = free
+    return found
 
 
 def completion_percentages(plan: Plan, calculated: dict[int, Scheduled] | None = None) -> dict[int, float]:

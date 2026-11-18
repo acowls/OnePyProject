@@ -97,7 +97,7 @@ def make_snapshot(plan: Plan) -> Snapshot:
             "ref": f"task:{task.uid}", "display_id": numbers[task.uid], "name": task.name,
             "parent": f"task:{task.parent}" if task.parent else None,
             "duration_days": task.duration, "earliest_date": task.earliest or None,
-            "mode": task.mode, "work_hours": task.work, "estimated": task.estimated,
+            "start_rule": task.start_mode, "mode": task.mode, "work_hours": task.work, "estimated": task.estimated,
             "percent_complete": task.percent_complete,
             "collapsed_summary_color": task.summary_color or None,
             "assignments": [{"resource": f"resource:{a.resource_uid}", "units_percent": a.units} for a in task.assignments],
@@ -369,6 +369,8 @@ def apply_operations(snapshot: Snapshot, proposal: dict, *, reserved_task_ids=()
             task.mode = new_mode
             if operation["earliest"] is not None:
                 task.earliest = _date(operation["earliest"], allow_empty=True)
+                if not task.earliest:
+                    task.start_mode = "no_earlier"  # Clearing the date releases a fixed start.
             if operation["estimated"] is not None:
                 task.estimated = operation["estimated"]
                 if (operation["estimated"] and not previous_estimate

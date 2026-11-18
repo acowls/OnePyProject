@@ -102,7 +102,8 @@ def compare_plans(before: Plan, after: Plan) -> PlanDiff:
         return getattr(task, field)
 
     fields = (("name", "Name"), ("parent", "Parent"), ("duration", "Duration days"),
-              ("earliest", "Earliest start"), ("mode", "Mode"), ("work", "Work hours"),
+              ("earliest", "Earliest start"), ("start_mode", "Start rule"), ("mode", "Mode"),
+              ("work", "Work hours"),
               ("estimated", "Estimated"), ("percent_complete", "Complete %"),
               ("summary_color", "Collapsed summary color"),
               ("predecessors", "Predecessors"), ("assignments", "Assignments"),

@@ -1956,3 +1956,40 @@ def test_task_dialog_offers_fixed_units_and_work_edit_changes_duration(app):
     again.work.setValue(80)
     again.apply(plan.tasks[0], plan)
     assert plan.tasks[0].duration == 2
+
+
+def test_task_dialog_fixes_a_start_and_a_blank_date_holds_the_calculated_start(app):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Lead in", duration=3),
+                                           Task(2, "Follow-on", duration=2, predecessors=[1])])
+    dialog = TaskDialog(plan.tasks[1], plan)
+    assert [dialog.start_mode.itemData(i) for i in range(dialog.start_mode.count())] == ["no_earlier", "fixed"]
+    assert dialog.start_mode.currentData() == "no_earlier"
+    dialog.start_mode.setCurrentIndex(dialog.start_mode.findData("fixed"))
+    dialog.apply(plan.tasks[1], plan)
+    # With no date typed, fixing the start holds the date the task has now.
+    assert (plan.tasks[1].start_mode, plan.tasks[1].earliest) == ("fixed", "2026-11-19")
+    again = TaskDialog(plan.tasks[1], plan)
+    assert again.start_mode.currentData() == "fixed" and again.earliest.text() == "2026-11-19"
+    again.earliest.setText("2026-11-17")
+    again.apply(plan.tasks[1], plan)
+    assert schedule(plan)[2].start.date().isoformat() == "2026-11-17"
+
+
+def test_start_cell_keeps_a_fixed_start_and_clearing_it_releases_it(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Follow-on", duration=2, predecessors=[1], earliest="2026-11-17", start_mode="fixed")])
+    window.refresh()
+    assert window.calculated[2].start.date().isoformat() == "2026-11-17"
+    assert set(window.fixed_conflicts) == {2}
+    tip = window.items[2].toolTip(3)
+    assert "Fixed start" in tip and "2026-11-19" in tip
+    assert "Edit the earliest allowed start" in window.items[1].toolTip(3)   # an ordinary task is unchanged
+    window.edit_cell(2, 3, "2026-11-18")                       # moving the date keeps the start fixed
+    assert window.plan.tasks[1].start_mode == "fixed" and window.calculated[2].start.date().isoformat() == "2026-11-18"
+    window.edit_cell(2, 3, "")                                 # clearing it releases the fixed start
+    assert (window.plan.tasks[1].earliest, window.plan.tasks[1].start_mode) == ("", "no_earlier")
+    assert window.calculated[2].start.date().isoformat() == "2026-11-19"
+    assert not window.fixed_conflicts
+    assert "Fixed start" not in window.items[2].toolTip(3)

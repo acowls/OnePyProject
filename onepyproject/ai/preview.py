@@ -5,7 +5,8 @@ import copy
 from dataclasses import dataclass
 
 from ..dependencies import remap_predecessors, task_numbers
-from ..model import MODE_LABELS, Plan, Scheduled, completion_percentages, estimated_tasks, schedule
+from ..model import (MODE_LABELS, START_MODE_LABELS, Plan, Scheduled, completion_percentages, estimated_tasks,
+                     schedule)
 from ..resources import format_task_resources
 from .diff import PlanDiff, compare_plans
 
@@ -108,6 +109,9 @@ def build_preview(before: Plan, after: Plan, format_date) -> PreviewData:
             if old.earliest != new.earliest:
                 changed.add(3)
                 details.append(f"Earliest start: {old.earliest or 'none'} → {new.earliest or 'none'}")
+            if old.start_mode != new.start_mode:
+                changed.add(3)
+                details.append(f"Start rule: {START_MODE_LABELS[old.start_mode]} → {START_MODE_LABELS[new.start_mode]}")
             for column, field in ((2, "duration"), (3, "start"), (4, "finish"), (7, "work")):
                 if getattr(old_item, field) != getattr(new_item, field):
                     changed.add(column)

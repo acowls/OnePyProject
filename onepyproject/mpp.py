@@ -1,11 +1,13 @@
 """Lossy MPP interchange. The OnePyProject plan is the editable source of truth."""
 from __future__ import annotations
 
+from collections import Counter
 import copy
 from datetime import datetime
 import math
 from pathlib import Path
 import os
+import re
 import struct
 import tempfile
 import warnings
@@ -17,7 +19,7 @@ from pymppwriter import Task as MppTask
 from pymppwriter import read_project
 
 from .model import (Plan, Resource, ResourceAssignment, Task, completion_percentages, estimated_tasks,
-                    schedule)
+                    schedule, start_conflicts)
 from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency, task_numbers
 from .resources import migrate_legacy_resources
 from .mpp_template import strip_template_resources
@@ -175,6 +177,7 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         links.setdefault(succ, []).append(format_dependency(Dependency(pred, rel.type, raw_lag / 4800, "d")))
     ids = {task.uid for task in source.tasks}
     summary_ids = {task.parent_uid for task in source.tasks if task.parent_uid}
+    pin_reasons: dict[int, str] = {}
     tasks = []
     for task in source.tasks:
         assns = assignments.get(task.uid, [])
@@ -203,26 +206,88 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
                              f"{numbers[link.uid]}; a summary task supports only FS and SS links")
             else:
                 predecessors.append(pred)
+        # What Project recorded decides whether the stored start is history or an instruction.
+        # A started or complete, manually scheduled or Must-Start/Finish-On task keeps its date
+        # whatever its predecessors say, which is how Project itself treats it. Every other
+        # task starts as a link-driven task; its start hint is chosen below from the dates.
+        reason = None if task.uid in summary_ids else _pin_reason(task)
+        if reason:
+            pin_reasons[task.uid] = reason
         tasks.append(Task(uid=task.uid, name=task.name or f"Task {numbers[task.uid]}", parent=task.parent_uid,
-                          earliest=task.start.date().isoformat(), duration=max(0, task.duration_days),
+                          earliest=task.start.date().isoformat() if reason else "",
+                          start_mode="fixed" if reason else "no_earlier",
+                          duration=max(0, task.duration_days),
                           mode=mode, work=hours if mode == "work" else 8.0,
                           assignments=assns, predecessors=predecessors, estimated=task.estimated,
                           percent_complete=getattr(task, "percent_complete", 0) or 0))
-    plan = Plan(title=source.title or "Imported project", start=source.start.date().isoformat(),
+    # The scheduler never starts a task before the project start, so a file whose recorded
+    # start is later than some of its tasks would push them all later. Start the plan at
+    # the earliest task instead, and say so.
+    project_start = source.start.date()
+    first_task = min((task.start.date() for task in source.tasks), default=project_start)
+    if first_task < project_start:
+        notes.append(f"Project start moved from {project_start} to {first_task}, "
+                     "the earliest task start in the file")
+        project_start = first_task
+    plan = Plan(title=source.title or "Imported project", start=project_start.isoformat(),
                 tasks=tasks, resources=resources)
-    scheduled = schedule(plan)  # Reject broken outlines or cycles rather than hiding them.
-    # The recalculated plan can disagree with the dates Project stored, for example when a
-    # link is not satisfied in the file or the project start is later than some tasks.
-    # Say so once instead of letting the schedule move silently.
     stored = {task.uid: task.start.date() for task in source.tasks}
-    later = [task for task in plan.tasks
-             if task.uid not in summary_ids and scheduled[task.uid].start.date() > stored[task.uid]]
-    if later:
-        first = later[0]
-        notes.append(f"Recalculation starts {len(later)} tasks later than the MPP file; the first is Task "
-                     f"{numbers[first.uid]} ({stored[first.uid]} became {scheduled[first.uid].start.date()}). "
-                     "Check its predecessors and the project start date")
+    # Choose each remaining task's start hint in one pass, in dependency order, so that a
+    # task is compared with what its already-placed predecessors give. Where the links
+    # reproduce the stored date there is no hint, so later edits flow through the links.
+    # A later stored date becomes a floor. An earlier one is a link the file itself breaks,
+    # so the task is fixed at its stored date rather than moved.
+    pinned_by_dates: list[int] = []
+
+    def choose_hint(task: Task, free) -> None:
+        day = stored[task.uid]
+        if task.uid in pin_reasons:
+            return
+        if free.date() > day:
+            task.start_mode, task.earliest = "fixed", day.isoformat()
+            pinned_by_dates.append(task.uid)
+        elif free.date() < day:
+            task.earliest = day.isoformat()
+
+    scheduled = schedule(plan, on_leaf=choose_hint)  # Also rejects broken outlines or cycles.
+    if pin_reasons:
+        counts = Counter(pin_reasons.values())
+        parts = ", ".join(f"{count} {label}" for label, count in counts.most_common())
+        notes.append(f"Tasks fixed at their file dates because Project records them as {parts}: {len(pin_reasons)}. "
+                     "Predecessors do not move them")
+    if pinned_by_dates:
+        first = pinned_by_dates[0]
+        notes.append(f"Tasks also fixed at their file dates because the file starts them before their "
+                     f"predecessors allow: {len(pinned_by_dates)}; the first is Task {numbers[first]} ({stored[first]})")
+    conflicts = start_conflicts(plan, scheduled)
+    if conflicts:
+        first = next(task.uid for task in plan.tasks if task.uid in conflicts)
+        notes.append(f"Fixed tasks that start before their predecessors finish, as in the file: {len(conflicts)}. "
+                     f"The links are kept; the first is Task {numbers[first]}")
+    # By construction every leaf now lands on its stored date. Say so if any does not,
+    # for example when a stored date is not a working day, instead of moving silently.
+    moved = [task for task in plan.tasks
+             if task.uid not in summary_ids and scheduled[task.uid].start.date() != stored[task.uid]]
+    if moved:
+        first = moved[0]
+        notes.append(f"Recalculation moves {_tasks(len(moved))} off the dates in the MPP file; the first is Task "
+                     f"{numbers[first.uid]} ({stored[first.uid]} became {scheduled[first.uid].start.date()})")
     return plan, notes
+
+
+def _tasks(count: int) -> str:
+    return f"{count} task" + ("" if count == 1 else "s")
+
+
+def _pin_reason(task) -> str | None:
+    """Why Project holds this task's stored start, or None if its links and hints decide it."""
+    if getattr(task, "manual", False):
+        return "manually scheduled"
+    if getattr(task, "constraint", None) in ("MSO", "MFO"):
+        return "Must Start On" if task.constraint == "MSO" else "Must Finish On"
+    if (getattr(task, "percent_complete", 0) or 0) > 0:
+        return "started"
+    return None
 
 
 def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
@@ -250,12 +315,20 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
         while parent:
             level += 1
             parent = by_uid[parent].parent
+        percent = round(progress[task.uid])
+        # A fixed start is a Must Start On constraint, so Project keeps the date whatever the
+        # links say. A task with progress needs no constraint: pymppwriter records its start as
+        # the actual start, which Project also holds. Other tasks keep the writer's default,
+        # a Start No Earlier Than constraint wherever the links do not already place them.
+        pin = task.start_mode == "fixed" and not item.summary and percent == 0
         out_tasks.append(MppTask(uid=task.uid, name=task.name, start=item.start, finish=item.finish,
                                  duration_days=item.duration, outline_level=level, parent_uid=task.parent,
                                  estimated=estimates[task.uid],
-                                 percent_complete=round(progress[task.uid]),
+                                 percent_complete=percent,
                                  task_type=EXPORT_TASK_TYPES[task.mode],
-                                 effort_driven=task.mode == "work"))
+                                 effort_driven=task.mode == "work",
+                                 constraint="MSO" if pin else None,
+                                 constraint_date=item.start if pin else None))
         if item.summary and task.assignments:
             raise ValueError(f"Cannot export task {numbers[task.uid]}: summary resource assignments are not supported")
         for assignment in task.assignments:
@@ -280,6 +353,13 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
                       assignments=assignments, calendar=calendar)
     notes = [f"Task {numbers[task.uid]}: custom collapsed-summary color is not preserved in MPP"
              for task in plan.tasks if task.summary_color]
+    conflicts = start_conflicts(plan, scheduled)
+    if conflicts:
+        notes.append(f"Fixed tasks that start before their predecessors finish: {len(conflicts)}. The links are "
+                     "written unchanged and the fixed dates are kept")
+    # pymppwriter warns that Project will move a task that starts before its links allow. That
+    # does not apply to a fixed task, which is written as a constraint or as progress.
+    fixed = {task.uid for task in plan.tasks if task.start_mode == "fixed"}
     target.parent.mkdir(parents=False, exist_ok=True)
     # Publish with a no-overwrite hard link, even if another process creates the
     # destination between the existence check and the end of the write.
@@ -292,7 +372,14 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
             strip_template_resources(writer)
             writer.write(project, temporary)
         os.link(temporary, target)
-        return notes + [str(item.message) for item in found]
+        messages = []
+        for item in found:
+            text = str(item.message)
+            match = re.match(r"task (\d+) ", text)
+            if match and int(match.group(1)) in fixed and "Project will move it" in text:
+                continue
+            messages.append(text)
+        return notes + messages
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

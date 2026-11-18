@@ -279,3 +279,101 @@ def test_fixed_units_schedules_from_the_stored_duration_and_derives_work():
     assert items[2].duration == 2 and items[2].work == 0
     with pytest.raises(ValueError, match="invalid scheduling mode"):
         schedule(Plan(tasks=[Task(1, mode="effort")]))
+
+
+def _lead_in_plan(**follow_on):
+    """Lead in runs 16-18 Nov 2026, so a task linked after it is placed on 19 Nov."""
+    return Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Follow-on", duration=2, predecessors=[1], **follow_on),
+        Task(3, "After", duration=1, predecessors=[2])])
+
+
+def test_a_task_with_a_floor_is_still_moved_later_by_its_predecessors():
+    items = schedule(_lead_in_plan(earliest="2026-11-17"))
+    assert items[2].start == datetime(2026, 11, 19, 8)
+    assert items[3].start == datetime(2026, 11, 23, 8)
+
+
+def test_a_fixed_start_is_not_moved_by_predecessors_and_still_drives_successors():
+    items = schedule(_lead_in_plan(earliest="2026-11-17", start_mode="fixed"))
+    assert items[2].start == datetime(2026, 11, 17, 8) and items[2].finish == datetime(2026, 11, 18, 17)
+    # The successor follows the fixed task, not the lead-in.
+    assert items[3].start == datetime(2026, 11, 19, 8)
+    # A fixed start can also sit later than the links would put it.
+    items = schedule(_lead_in_plan(earliest="2026-11-24", start_mode="fixed"))
+    assert items[2].start == datetime(2026, 11, 24, 8)
+
+
+def test_a_fixed_start_ignores_links_inherited_from_its_summary():
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Phase", predecessors=[1]),
+        Task(3, "Planned", parent=2, duration=1),
+        Task(4, "Started", parent=2, duration=2, earliest="2026-11-16", start_mode="fixed")])
+    items = schedule(plan)
+    assert items[3].start == datetime(2026, 11, 19, 8)       # the summary link floors this one
+    assert items[4].start == datetime(2026, 11, 16, 8)       # but not the fixed one
+    assert items[2].start == datetime(2026, 11, 16, 8)       # so the summary starts with it
+
+
+def test_a_fixed_start_before_the_project_start_is_held_at_the_project_start():
+    items = schedule(Plan(start="2026-11-16", tasks=[Task(1, "Early", earliest="2026-11-02", start_mode="fixed")]))
+    assert items[1].start == datetime(2026, 11, 16, 8)
+
+
+def test_a_fixed_task_still_reports_unknown_predecessors_and_cycles():
+    with pytest.raises(ValueError, match="Task 1: predecessor internal ID 99 does not exist"):
+        schedule(Plan(tasks=[Task(1, "A", earliest="2026-11-16", start_mode="fixed", predecessors=[99])]))
+    with pytest.raises(ValueError, match="cycle"):
+        schedule(Plan(tasks=[Task(1, "A", earliest="2026-11-16", start_mode="fixed", predecessors=[2]),
+                             Task(2, "B", predecessors=[1])]))
+
+
+def test_fixed_start_validation():
+    with pytest.raises(ValueError, match="Task 1: a fixed start needs a date"):
+        schedule(Plan(tasks=[Task(1, "A", start_mode="fixed")]))
+    with pytest.raises(ValueError, match="Task 1: invalid start type"):
+        schedule(Plan(tasks=[Task(1, "A", start_mode="soon")]))
+
+
+def test_start_conflicts_lists_fixed_tasks_that_start_before_their_predecessors_finish():
+    from onepyproject.model import start_conflicts
+    plan = _lead_in_plan(earliest="2026-11-17", start_mode="fixed")
+    assert start_conflicts(plan) == {2: datetime(2026, 11, 19, 8)}
+    assert start_conflicts(plan, schedule(plan)) == {2: datetime(2026, 11, 19, 8)}
+    plan.tasks[1].earliest = "2026-11-19"                    # on the date the links give: no conflict
+    assert start_conflicts(plan) == {}
+    plan.tasks[1].earliest = "2026-11-24"                    # later than the links: no conflict
+    assert start_conflicts(plan) == {}
+    plan.tasks[1].start_mode = "no_earlier"                  # only fixed tasks are reported
+    plan.tasks[1].earliest = "2026-11-17"
+    assert start_conflicts(plan) == {}
+
+
+def test_on_leaf_sees_the_link_only_start_and_can_choose_the_hint():
+    plan = _lead_in_plan()
+    seen = {}
+
+    def choose(task, free):
+        seen[task.uid] = free
+        if task.uid == 2:
+            task.start_mode, task.earliest = "fixed", "2026-11-17"
+
+    items = schedule(plan, on_leaf=choose)
+    # Task 3 is placed after task 2 has been fixed, so it sees the fixed dates, not the lead-in's.
+    assert seen == {1: datetime(2026, 11, 16, 8), 2: datetime(2026, 11, 19, 8), 3: datetime(2026, 11, 19, 8)}
+    assert items[2].start == datetime(2026, 11, 17, 8)
+    assert items[3].start == datetime(2026, 11, 19, 8)
+
+
+def test_start_mode_round_trips_and_older_plans_load_as_no_earlier(tmp_path):
+    plan = _lead_in_plan(earliest="2026-11-17", start_mode="fixed")
+    path = tmp_path / "fixed.pxplan"
+    save_plan(plan, path)
+    assert load_plan(path) == plan
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    for task in stored["plan"]["tasks"]:
+        del task["start_mode"]
+    path.write_text(json.dumps(stored), encoding="utf-8")
+    assert {task.start_mode for task in load_plan(path).tasks} == {"no_earlier"}

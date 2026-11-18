@@ -206,3 +206,15 @@ def test_proposal_parser_fails_closed_for_invalid_content():
                 json.dumps(proposal(snapshot, operation("update_task", target="task:10", duration_days=True)))):
         with pytest.raises(ProposalError):
             parse_proposal(raw, snapshot.revision)
+
+
+def test_clearing_the_earliest_date_of_a_fixed_task_releases_the_fixed_start():
+    plan = sample_plan()
+    plan.tasks[1].earliest, plan.tasks[1].start_mode = "2026-11-17", "fixed"
+    snapshot = make_snapshot(plan)
+    candidate = apply_operations(snapshot, proposal(snapshot, operation("update_task", target="task:40", earliest="")))
+    assert (candidate.tasks[1].earliest, candidate.tasks[1].start_mode) == ("", "no_earlier")
+    moved = apply_operations(snapshot, proposal(snapshot, operation("update_task", target="task:40",
+                                                                    earliest="2026-11-30")))
+    assert (moved.tasks[1].earliest, moved.tasks[1].start_mode) == ("2026-11-30", "fixed")
+    assert schedule(moved)[40].start.date().isoformat() == "2026-11-30"

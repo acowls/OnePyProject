@@ -21,8 +21,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QColo
 from PySide6.QtCore import QPointF
 
 from . import __version__
-from .model import (MODE_LABELS, MODE_NAMES, MODES, Plan, Task, completion_percentages, descendants,
-                    estimated_tasks, indent, load_plan, outdent, save_plan, schedule, total_units)
+from .model import (MODE_LABELS, MODE_NAMES, MODES, START_MODE_LABELS, START_MODES, Plan, Task,
+                    completion_percentages, descendants, estimated_tasks, indent, load_plan, outdent, save_plan,
+                    schedule, start_conflicts, total_units)
 from .dependencies import parse_dependency, parse_display_predecessors, remap_predecessors, task_numbers
 from .icons import toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
@@ -434,8 +435,17 @@ class TaskDialog(QDialog):
         layout.addLayout(form)
         self.name = QLineEdit(task.name)
         self.name.setMinimumWidth(500)
+        self.calculated_start = calculated.start.date().isoformat() if calculated else plan.start
         self.earliest = QLineEdit(task.earliest)
         self.earliest.setPlaceholderText("YYYY-MM-DD; blank uses project start")
+        self.start_mode = QComboBox()
+        for start_mode in START_MODES:
+            self.start_mode.addItem(START_MODE_LABELS[start_mode], start_mode)
+        self.start_mode.setCurrentIndex(self.start_mode.findData(task.start_mode))
+        self.start_mode.setAccessibleName("Start rule")
+        self.start_mode.setToolTip("No earlier than: predecessors can still move the task later. "
+                                   "Fixed: the task stays on this date whatever its predecessors say, "
+                                   "like a task that has already started.")
         self.mode = QComboBox()
         for mode in MODES:
             self.mode.addItem(MODE_NAMES[mode], mode)
@@ -508,7 +518,7 @@ class TaskDialog(QDialog):
         self.predecessors = QLineEdit(self.original_predecessors)
         self.predecessors.setMinimumWidth(500)
         self.predecessors.setPlaceholderText("e.g. 5FS+2d, 6SS-1d")
-        for label, widget in (("Name", self.name), ("Earliest start", self.earliest),
+        for label, widget in (("Name", self.name), ("Start date", self.earliest), ("Start rule", self.start_mode),
                               ("Scheduling", self.mode), ("Duration", self.duration_row),
                               ("Complete", self.percent_complete), ("Work", self.work), ("Resources", self.resource),
                               ("Predecessors", self.predecessors)):
@@ -527,6 +537,10 @@ class TaskDialog(QDialog):
     def apply(self, task: Task, plan: Plan) -> None:
         task.name = self.name.text().strip()
         task.earliest = self.earliest.text().strip()
+        task.start_mode = self.start_mode.currentData()
+        if task.start_mode == "fixed" and not task.earliest:
+            # Fixing a start holds the date the task has now.
+            task.earliest = self.calculated_start
         task.mode = self.mode.currentData()
         if self.duration_changed:
             task.duration = self.duration.value()
@@ -1453,6 +1467,7 @@ class MainWindow(QMainWindow):
         else:
             selection = [selected] if isinstance(selected, int) else list(selected)
         self.calculated = schedule(self.plan)
+        self.fixed_conflicts = start_conflicts(self.plan, self.calculated)
         progress = completion_percentages(self.plan, self.calculated)
         self.progress_percentages = progress
         self.resource_warnings = overallocation_warnings(self.plan)
@@ -1475,7 +1490,19 @@ class MainWindow(QMainWindow):
             node.setData(0, Qt.ItemDataRole.UserRole, task.uid)
             node.setFlags(node.flags() | Qt.ItemFlag.ItemIsEditable)
             node.setToolTip(2, "A question mark indicates an estimated duration.")
-            node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
+            if task.start_mode == "fixed" and not item.summary:
+                tip = (f"{display_time(item.start, self.date_format)}\nFixed start: predecessors do not move this task. "
+                       "Edit the date (YYYY-MM-DD) to move it, or clear it to release the fixed start.")
+                if task.uid in self.fixed_conflicts:
+                    tip += (f"\nIts predecessors would start it on {self.fixed_conflicts[task.uid].date().isoformat()}; "
+                            "the link is kept.")
+                    node.setForeground(3, QColor("#a72a25"))
+                font = QFont()
+                font.setBold(True)
+                node.setFont(3, font)
+                node.setToolTip(3, tip)
+            else:
+                node.setToolTip(3, f"{display_time(item.start, self.date_format)}\nEdit the earliest allowed start (YYYY-MM-DD); predecessors may move it later.")
             node.setToolTip(4, display_time(item.finish, self.date_format))
             node.setToolTip(5, "Use displayed task IDs: 5, 5SS+3d, 5FF-1d, 5FS+2ed or 5FS+50%; separate with commas."
                                + (" A summary task supports only FS and SS links, which apply to every subtask."
@@ -1737,6 +1764,8 @@ class MainWindow(QMainWindow):
                 if not task.earliest and text == self.calculated[uid].start.date().isoformat():
                     return
                 task.earliest = date.fromisoformat(text).isoformat() if text else ""
+                if not task.earliest:
+                    task.start_mode = "no_earlier"  # Clearing the date also releases a fixed start.
             elif column == 5:
                 current = ", ".join(map(str, remap_predecessors(task.predecessors, task_numbers(self.plan.tasks))))
                 if text == current.strip():
