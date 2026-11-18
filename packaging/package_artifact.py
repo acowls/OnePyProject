@@ -91,7 +91,7 @@ def make_artifact(target, dist, output):
         shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
         licences = stage / "licenses"
         licences.mkdir()
-        for dependency in ("pymppwriter", "olefile", "PyInstaller", "openai", "keyring"):
+        for dependency in ("pymppwriter", "olefile", "PyInstaller", "openai", "keyring", "google-auth", "requests"):
             copy_distribution_license(dependency, licences / f"{dependency.lower()}.txt")
         shutil.copyfile(ROOT / "onepyproject" / "assets" / "flat_color_icons" / "LICENSE.txt", licences / "icons8.txt")
         manifest = {
@@ -99,7 +99,8 @@ def make_artifact(target, dist, output):
             "version": VERSION,
             "python": sys.version,
             "dependencies": {name: metadata.version(name) for name in
-                             ("PySide6-Essentials", "shiboken6", "pymppwriter", "olefile", "PyInstaller", "openai", "keyring")},
+                             ("PySide6-Essentials", "shiboken6", "pymppwriter", "olefile", "PyInstaller", "openai",
+                              "keyring", "google-auth", "requests")},
             "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
             "warning": "Private test build; distribution compliance and signing are not validated.",
         }

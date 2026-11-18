@@ -24,6 +24,18 @@ class FoundryConfig:
 
 
 @dataclass(frozen=True)
+class GeminiConfig:
+    project: str
+    location: str
+    model: str
+
+    @property
+    def endpoint(self) -> str:
+        host = "aiplatform.googleapis.com" if self.location == "global" else f"{self.location}-aiplatform.googleapis.com"
+        return f"https://{host}/v1/projects/{self.project}/locations/{self.location}/endpoints/openapi/"
+
+
+@dataclass(frozen=True)
 class AIResult:
     message: str
     clarification: bool
@@ -71,6 +83,19 @@ def normalize_config(endpoint: str, deployment: str) -> FoundryConfig:
     return FoundryConfig(urlunsplit(("https", host, "/openai/v1/", "", "")), deployment)
 
 
+def normalize_gemini_config(project: str, location: str, model: str) -> GeminiConfig:
+    if not all(isinstance(value, str) for value in (project, location, model)):
+        raise ProviderError("Enter the Google Cloud project, location, and Gemini model.")
+    project, location, model = project.strip(), location.strip().lower(), model.strip()
+    if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project):
+        raise ProviderError("Enter a valid Google Cloud project ID (6–30 lowercase letters, digits, or hyphens).")
+    if location != "global" and not re.fullmatch(r"[a-z]+(?:-[a-z]+)*\d+", location):
+        raise ProviderError("Enter a Google Cloud location such as global, us-central1, or europe-west4.")
+    if not model or len(model) > 128 or not re.fullmatch(r"google/[a-zA-Z0-9][a-zA-Z0-9._-]*", model):
+        raise ProviderError("Enter a Gemini model ID such as google/gemini-2.5-flash.")
+    return GeminiConfig(project, location, model)
+
+
 def _guard_request(request, config: FoundryConfig, key: str, *, discovery=False) -> None:
     """Prevent ambient SDK headers or redirects from sending other credentials."""
     actual, expected = urlsplit(str(request.url)), urlsplit(config.endpoint)
@@ -83,6 +108,44 @@ def _guard_request(request, config: FoundryConfig, key: str, *, discovery=False)
     request.headers.update({"Host": expected.netloc, "Authorization": f"Bearer {key}",
                             "Content-Type": "application/json", "Accept": "application/json",
                             "User-Agent": "OnePyProject", "Content-Length": str(len(request.content))})
+
+
+def _guard_gemini_request(request, config: GeminiConfig, token: str) -> None:
+    """Limit OAuth credentials to the configured Google Cloud OpenAI-compatible endpoint."""
+    actual, expected = urlsplit(str(request.url)), urlsplit(config.endpoint)
+    if (request.method != "POST" or actual.scheme != "https" or actual.netloc.lower() != expected.netloc.lower()
+            or actual.path != expected.path + "chat/completions" or actual.query or actual.fragment):
+        raise ProviderError("The AI request attempted to use an unexpected Google endpoint.")
+    for header in list(request.headers):
+        del request.headers[header]
+    request.headers.update({"Host": expected.netloc, "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json", "Accept": "application/json",
+                            "User-Agent": "OnePyProject", "Content-Length": str(len(request.content))})
+
+
+def google_access_token(*, credentials_factory=None, request_factory=None) -> str:
+    """Refresh a Google Cloud ADC credential for this request; never persist the access token."""
+    try:
+        import google.auth
+        from google.auth.exceptions import DefaultCredentialsError
+        from google.auth.transport.requests import Request
+    except ImportError as exc:
+        raise ProviderError("Google Cloud authentication support is not installed. Update the application dependencies.") from exc
+    try:
+        credentials, _ = (credentials_factory or google.auth.default)(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        credentials.refresh((request_factory or Request)())
+        token = credentials.token
+        if (not isinstance(token, str) or not token.strip() or len(token) > 8192
+                or any(ord(character) < 33 or ord(character) > 126 for character in token.strip())):
+            raise ProviderError("Google Cloud returned an invalid access token. Sign in again and retry.")
+        return token.strip()
+    except ProviderError:
+        raise
+    except DefaultCredentialsError as exc:
+        raise ProviderError("Google Cloud sign-in was not found. Use Sign in with Google in AI settings and try again.") from exc
+    except Exception as exc:
+        raise ProviderError("Google Cloud sign-in failed or expired. Sign in again and check your project permissions.") from exc
 
 
 def discover_models(config: FoundryConfig, key: str, *, client_factory=None):
@@ -185,6 +248,15 @@ def request_proposal(config: FoundryConfig, key: str, snapshot: Snapshot, prompt
                      reserved_resource_ids=(), effort=None, client_factory=None) -> AIResult:
     config = normalize_config(config.endpoint, config.deployment)
     key = validate_api_key(key)
+    return _request_proposal(config.endpoint, config.deployment, key, snapshot, prompt, history=history,
+                             base_prompt=base_prompt, reserved_task_ids=reserved_task_ids,
+                             reserved_resource_ids=reserved_resource_ids, effort=effort,
+                             request_guard=lambda request: _guard_request(request, config, key),
+                             client_factory=client_factory, provider="Foundry", store=False,
+                             output_limit="max_completion_tokens")
+
+
+def _validate_proposal_inputs(prompt, history, base_prompt, effort):
     if effort is not None and effort not in EFFORTS:
         raise ProviderError("Unsupported reasoning effort.")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
@@ -207,31 +279,59 @@ def request_proposal(config: FoundryConfig, key: str, snapshot: Snapshot, prompt
         raise ProviderError("The AI prompt or conversation contains invalid text.") from exc
     if history_bytes > MAX_HISTORY_BYTES:
         raise ProviderError("The conversation is too long. Clear the session before continuing.")
+    return history
+
+
+def request_gemini_proposal(config: GeminiConfig, snapshot: Snapshot, prompt: str, *,
+                            history=None, base_prompt=DEFAULT_BASE_PROMPT, reserved_task_ids=(),
+                            reserved_resource_ids=(), effort=None, client_factory=None,
+                            credentials_factory=None, request_factory=None) -> AIResult:
+    config = normalize_gemini_config(config.project, config.location, config.model)
+    if effort is not None and effort not in ("minimal", "low", "medium", "high"):
+        raise ProviderError("Unsupported Gemini reasoning effort.")
+    history = _validate_proposal_inputs(prompt, history, base_prompt, effort)
+    token = google_access_token(credentials_factory=credentials_factory, request_factory=request_factory)
+    return _request_proposal(config.endpoint, config.model, token, snapshot, prompt, history=history,
+                             base_prompt=base_prompt, reserved_task_ids=reserved_task_ids,
+                             reserved_resource_ids=reserved_resource_ids, effort=effort,
+                             request_guard=lambda request: _guard_gemini_request(request, config, token),
+                             client_factory=client_factory, provider="Google Cloud", store=None,
+                             output_limit="max_tokens")
+
+
+def _request_proposal(endpoint, model, key, snapshot, prompt, *, history=None, base_prompt=DEFAULT_BASE_PROMPT,
+                      reserved_task_ids=(), reserved_resource_ids=(), effort=None, request_guard=None,
+                      client_factory=None, provider="AI", store=None, output_limit="max_completion_tokens") -> AIResult:
+    history = _validate_proposal_inputs(prompt, history, base_prompt, effort)
     try:
         from openai import DefaultHttpxClient, OpenAI
     except ImportError as exc:
-        raise ProviderError("The OpenAI client is not installed. Install the application dependencies.") from exc
+        raise ProviderError("The OpenAI-compatible client is not installed. Install the application dependencies.") from exc
     factory = client_factory or OpenAI
     # Disable redirects so credentials are never forwarded to another host.
     transport = DefaultHttpxClient(follow_redirects=False,
-                                   event_hooks={"request": [lambda request: _guard_request(request, config, key)]})
+                                   event_hooks={"request": [request_guard]})
     client = None
     try:
-        client = factory(base_url=config.endpoint, api_key=key, admin_api_key="", organization="", project="",
+        client = factory(base_url=endpoint, api_key=key, admin_api_key="", organization="", project="",
                          webhook_secret="", default_headers={"Authorization": f"Bearer {key}"},
                          http_client=transport, timeout=60.0, max_retries=0)
-        response = client.chat.completions.create(
-            model=config.deployment,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT +
-                       "\n\nUser-supplied planning preferences (subordinate to the safety rules above):\n" + base_prompt},
-                      *history,
-                      {"role": "user", "content": json.dumps({"request": prompt.strip(), "snapshot": snapshot.payload},
-                                                              ensure_ascii=False, allow_nan=False)}],
-            response_format={"type": "json_schema", "json_schema": {"name": "onepyproject_proposal",
-                             "strict": True, "schema": PROPOSAL_SCHEMA}},
-            max_completion_tokens=4096, store=False,
-            **({"reasoning_effort": effort} if effort is not None else {}),
-        )
+        request_args = {
+            "model": model,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT +
+                          "\n\nUser-supplied planning preferences (subordinate to the safety rules above):\n" + base_prompt},
+                         *history,
+                         {"role": "user", "content": json.dumps({"request": prompt.strip(), "snapshot": snapshot.payload},
+                                                                 ensure_ascii=False, allow_nan=False)}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "onepyproject_proposal",
+                                "strict": True, "schema": PROPOSAL_SCHEMA}},
+            output_limit: 4096,
+        }
+        if store is not None:
+            request_args["store"] = store
+        if effort is not None:
+            request_args["reasoning_effort"] = effort
+        response = client.chat.completions.create(**request_args)
         if not response.choices or response.choices[0].finish_reason != "stop":
             raise ProviderError("The model response was incomplete or filtered; no changes were applied.")
         message = response.choices[0].message
@@ -259,14 +359,16 @@ def request_proposal(config: FoundryConfig, key: str, snapshot: Snapshot, prompt
     except Exception as exc:
         status = getattr(exc, "status_code", None)
         if status in (401, 403):
+            if provider == "Google Cloud":
+                raise ProviderError("Google Cloud rejected the sign-in or denied access. Sign in again and check Vertex AI permissions.") from exc
             raise ProviderError("The endpoint rejected the API key. Check the key and whether key access is enabled.") from exc
         if status == 404:
-            raise ProviderError("The endpoint or deployment was not found.") from exc
+            raise ProviderError("The endpoint or model was not found. Check the configured project, location, and model ID.") from exc
         if status == 429:
-            raise ProviderError("The service is rate limited or out of capacity. Try again later.") from exc
+            raise ProviderError("The AI service is rate limited or out of capacity. Try again later.") from exc
         if status == 400:
-            raise ProviderError("The deployment rejected the request; it may not support the selected effort, structured outputs or this API.") from exc
-        raise ProviderError("The AI request failed. Check the connection and endpoint; no changes were applied.") from exc
+            raise ProviderError("The model rejected the request; it may not support the selected effort, structured outputs, or this API.") from exc
+        raise ProviderError("The AI request failed. Check the connection and provider configuration; no changes were applied.") from exc
     finally:
         if client is not None:
             try:

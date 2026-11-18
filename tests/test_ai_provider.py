@@ -6,7 +6,9 @@ import pytest
 import httpx2
 
 from onepyproject.ai.proposals import FIELDS, make_snapshot
-from onepyproject.ai.provider import CredentialStore, FoundryConfig, ProviderError, discover_models, normalize_config, request_proposal
+from onepyproject.ai.provider import (CredentialStore, FoundryConfig, ProviderError, discover_models,
+                                      google_access_token, normalize_config, normalize_gemini_config, request_gemini_proposal,
+                                      request_proposal)
 from onepyproject.model import Plan, Task
 
 
@@ -23,6 +25,29 @@ def test_foundry_endpoint_normalization(endpoint):
 def test_endpoint_rejects_unsafe_or_unsupported_urls(endpoint):
     with pytest.raises(ProviderError):
         normalize_config(endpoint, "model")
+
+
+@pytest.mark.parametrize(("project", "location", "model"), [
+    ("onepyproject-123", "global", "google/gemini-3.5-flash"),
+    ("onepyproject-123", "us-central1", "google/gemini-2.5-pro"),
+])
+def test_gemini_config_builds_only_google_cloud_endpoints(project, location, model):
+    config = normalize_gemini_config(project, location, model)
+    assert config.model == model
+    assert config.endpoint.startswith("https://")
+    assert ("aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com") in config.endpoint
+    assert f"/projects/{project}/locations/{location}/endpoints/openapi/" in config.endpoint
+
+
+@pytest.mark.parametrize(("project", "location", "model"), [
+    ("../attacker", "global", "google/gemini-flash"),
+    ("toolong", "https://attacker", "google/gemini-flash"),
+    ("valid-project", "global", "https://attacker/model"),
+    ("valid-project", "global", "model"),
+])
+def test_gemini_config_rejects_invalid_project_location_or_model(project, location, model):
+    with pytest.raises(ProviderError):
+        normalize_gemini_config(project, location, model)
 
 
 def test_credentials_only_use_explicit_backend_and_are_bound_to_resource(monkeypatch):
@@ -94,6 +119,67 @@ def test_request_sends_only_approved_snapshot_and_builds_local_candidate():
     sent = json.loads(calls["request"]["messages"][1]["content"])
     assert sent["request"] == "Make design 3 days" and sent["snapshot"] == snapshot.payload
     assert "test-secret" not in json.dumps(calls["request"])
+
+
+def test_gemini_request_refreshes_google_credentials_and_guards_endpoint():
+    snapshot = make_snapshot(Plan(tasks=[Task(1, "Design")]))
+    body = {"schema_version": "1", "snapshot_revision": snapshot.revision, "message": "Need details",
+            "needs_clarification": True, "operations": []}
+    calls = {}
+    class Credentials:
+        token = "short-lived-google-token"
+        def refresh(self, request):
+            calls["refreshed"] = request
+    credentials = Credentials()
+    def credential_factory(*, scopes):
+        calls["scopes"] = scopes
+        return credentials, None
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+            self.transport = kwargs["http_client"]
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        def create(self, **kwargs):
+            calls["request"] = kwargs
+            return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+                message=SimpleNamespace(content=json.dumps(body), refusal=None))],
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4))
+        def close(self):
+            self.transport.close()
+    config = normalize_gemini_config("onepyproject-123", "global", "google/gemini-3.5-flash")
+    result = request_gemini_proposal(config, snapshot, "What changed?", client_factory=FakeClient,
+                                     credentials_factory=credential_factory, request_factory=lambda: "refresh-request")
+    assert result.clarification and result.prompt_tokens == 12
+    assert calls["refreshed"] == "refresh-request"
+    assert calls["scopes"] == ["https://www.googleapis.com/auth/cloud-platform"]
+    assert calls["request"]["model"] == "google/gemini-3.5-flash"
+    assert calls["request"]["max_tokens"] == 4096 and "store" not in calls["request"]
+    hook = calls["client"]["http_client"].event_hooks["request"][0]
+    request = httpx2.Request("POST", config.endpoint + "chat/completions", headers={
+        "Authorization": "Bearer other-token", "X-Ambient-Secret": "ambient-secret"})
+    hook(request)
+    assert request.headers["Authorization"] == "Bearer short-lived-google-token"
+    assert "X-Ambient-Secret" not in request.headers
+    with pytest.raises(ProviderError):
+        hook(httpx2.Request("POST", "https://attacker.example/steal"))
+    assert "short-lived-google-token" not in json.dumps(calls["request"])
+
+
+def test_gemini_missing_adc_reports_sign_in_instructions_without_leaking_details():
+    from google.auth.exceptions import DefaultCredentialsError
+    def missing_credentials(**kwargs):
+        raise DefaultCredentialsError("private ADC file path")
+    with pytest.raises(ProviderError, match="Sign in with Google") as error:
+        google_access_token(credentials_factory=missing_credentials)
+    assert "private ADC file path" not in str(error.value)
+
+
+def test_gemini_invalid_prompt_fails_before_loading_google_credentials():
+    def unexpected(**kwargs):
+        raise AssertionError("Credentials should not be loaded for an invalid prompt")
+    config = normalize_gemini_config("onepyproject-123", "global", "google/gemini-3.5-flash")
+    with pytest.raises(ProviderError, match="Enter a request"):
+        request_gemini_proposal(config, make_snapshot(Plan()), "", credentials_factory=unexpected)
 
 
 def test_provider_errors_do_not_disclose_secrets_or_project_data():
