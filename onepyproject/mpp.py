@@ -42,7 +42,7 @@ def _mpp_relation_records(path: str | Path) -> list[tuple[int, int, int, int, in
     The library is pinned; fail instead of guessing if its private structures change.
     """
     from pymppwriter import blocks as blocks
-    from pymppwriter.reader import _Reader
+    from pymppwriter.reader import _Reader, declared_count
     reader = _Reader(str(path))
     fields, _ = reader._class_map(blocks.PROPS_RELATION_FIELD_MAP)
     old_layout = fields.get(9) is not None and fields[9].offset == 0
@@ -53,7 +53,8 @@ def _mpp_relation_records(path: str | Path) -> list[tuple[int, int, int, int, in
     except KeyError:
         return []
     result = []
-    for record in records:
+    # Same live-record rule as the reader: entries past the declared count are stale.
+    for record in records[:declared_count(reader.props, blocks.PROPS_REL_RECORD_COUNT, len(records))]:
         if len(record) < 20:
             continue
         _, pred, succ = struct.unpack_from("<III", record, 0)
@@ -71,11 +72,13 @@ def _mpp_resource_values(path: str | Path):
     from pymppwriter.reader import _Klass, _Reader
     from pymppwriter.writer import ASSN_META_SIZE, ASSN_NATIVE, RSC_META_SIZE, RSC_NATIVE
     reader = _Reader(str(path))
-    resource_records = _Klass(reader, "   114/TBkndRsc", RSC_META_SIZE, 53, blocks.PROPS_RESOURCE_FIELD_MAP)
-    assignment_records = _Klass(reader, "   114/TBkndAssn", ASSN_META_SIZE, 53, blocks.PROPS_ASSIGNMENT_FIELD_MAP)
+    resource_records = _Klass(reader, "   114/TBkndRsc", RSC_META_SIZE, 53, blocks.PROPS_RESOURCE_FIELD_MAP,
+                              blocks.PROPS_RESOURCE_RECORD_COUNT)
+    assignment_records = _Klass(reader, "   114/TBkndAssn", ASSN_META_SIZE, 53, blocks.PROPS_ASSIGNMENT_FIELD_MAP,
+                                blocks.PROPS_ASSN_RECORD_COUNT)
     capacities = {}
-    for i, record in enumerate(resource_records.recs):
-        if len(record) <= 100:
+    for i in resource_records.live_rows():
+        if len(resource_records.recs[i]) <= 100:
             continue
         uid = resource_records.value(i, RSC_NATIVE["UNIQUE_ID"], "<I")
         if uid:
@@ -83,7 +86,7 @@ def _mpp_resource_values(path: str | Path):
             if value is not None:
                 capacities[uid] = value / 100
     allocations = []
-    for i, _ in enumerate(assignment_records.recs):
+    for i in assignment_records.live_rows():
         task_uid = assignment_records.value(i, ASSN_NATIVE["TASK_UNIQUE_ID"], "<I")
         resource_uid = assignment_records.value(i, ASSN_NATIVE["RESOURCE_UNIQUE_ID"], "<i")
         if task_uid and resource_uid is not None and resource_uid > 0:
@@ -98,10 +101,11 @@ def _mpp_task_work(path: str | Path) -> dict[int, tuple[int | None, float | None
     from pymppwriter.reader import _Klass, _Reader
     from pymppwriter.writer import NATIVE, TASK_META_SIZE, TASK_META2_SIZE
     reader = _Reader(str(path))
-    tasks = _Klass(reader, "   114/TBkndTask", TASK_META_SIZE, TASK_META2_SIZE, blocks.PROPS_TASK_FIELD_MAP)
+    tasks = _Klass(reader, "   114/TBkndTask", TASK_META_SIZE, TASK_META2_SIZE, blocks.PROPS_TASK_FIELD_MAP,
+                   blocks.PROPS_TASK_RECORD_COUNT)
     result = {}
-    for i, record in enumerate(tasks.recs):
-        if len(record) <= 100:
+    for i in tasks.live_rows():
+        if len(tasks.recs[i]) <= 100:
             continue
         uid = tasks.value(i, NATIVE["UNIQUE_ID"], "<I")
         if uid:
