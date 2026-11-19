@@ -31,6 +31,11 @@ def run():
     app.setApplicationName("OnePyProject packaging smoke test")
     if pymppwriter.__version__ != "0.4.3":
         raise RuntimeError(f"Unexpected pymppwriter version: {pymppwriter.__version__}")
+    # The pinned fork reports the same version as the PyPI release, so check for what only the fork has:
+    # the reader that skips stale records, and the writer step that places a lead before its predecessor.
+    from pymppwriter import reader, writer
+    if not hasattr(reader._Klass, "live_rows") or not hasattr(writer, "retreat_working"):
+        raise RuntimeError("pymppwriter lacks the fixes OnePyProject needs; build against the pinned fork commit")
 
     # Bypass toolbar_icon's fallback so missing SVG plugins cannot pass silently.
     for filename in ICON_FILES.values():
