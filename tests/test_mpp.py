@@ -92,7 +92,36 @@ def test_percent_complete_mpp_roundtrip(tmp_path):
     export_mpp(plan, TEMPLATE, output)
     imported, notes = import_mpp(output)
     assert [task.percent_complete for task in imported.tasks] == [57, 35, 100]
-    assert not notes
+    # Project holds a started task at its actual start, so the importer fixes both and says so
+    assert [task.start_mode for task in imported.tasks] == ["no_earlier", "fixed", "fixed"]
+    assert notes == ["Tasks fixed at their file dates because Project records them as 2 started: 2. "
+                     "Predecessors do not move them"]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_start_rules_survive_an_mpp_round_trip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead", duration=2),
+        Task(2, "Pinned before its link", duration=1, predecessors=[1], earliest="2026-11-16", start_mode="fixed"),
+        Task(3, "Pinned after its link", duration=1, predecessors=[1], earliest="2026-11-23", start_mode="fixed"),
+        Task(4, "Floor", duration=1, predecessors=[1], earliest="2026-11-25"),
+        Task(5, "Link driven", duration=1, predecessors=[1])])
+    expected = schedule(plan)
+    output = tmp_path / "start-rules.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, _ = import_mpp(output)
+    by_name = {task.name: task for task in imported.tasks}
+    # A fixed task is written as Must Start On and comes back fixed; a floor comes back as a floor because
+    # its date is later than its links give; a task its links already place carries no rule.
+    assert [(name, task.start_mode, task.earliest) for name, task in by_name.items()] == [
+        ("Lead", "no_earlier", ""),
+        ("Pinned before its link", "fixed", "2026-11-16"),
+        ("Pinned after its link", "fixed", "2026-11-23"),
+        ("Floor", "no_earlier", "2026-11-25"),
+        ("Link driven", "no_earlier", "")]
+    dates = schedule(imported)
+    assert {task.name: dates[task.uid].start for task in imported.tasks} == {
+        task.name: expected[task.uid].start for task in plan.tasks}
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
