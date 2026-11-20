@@ -11,7 +11,7 @@ image-format and platform plugins; those need their own distribution audit.
 - LGPLv3: https://www.gnu.org/licenses/lgpl-3.0.html
 - GPLv3 (incorporated by LGPLv3): https://www.gnu.org/licenses/gpl-3.0.html
 - Qt/PySide source releases: https://download.qt.io/official_releases/
-- pymppwriter 0.4.3: MIT; its licence is included in `licenses/pymppwriter.txt`.
+- pymppwriter 0.4.3, from the `acowls/pymppwriter` fork at commit 53e396b (pinned in `pyproject.toml`; `BUILD_INFO.json` records the source): MIT; its licence is included in `licenses/pymppwriter.txt`.
 - olefile: BSD-style and PIL licences; included in `licenses/olefile.txt`.
 - Icons8 Flat Color Icons: MIT option; included in `licenses/icons8.txt`.
 - PyInstaller: GPL with a bootloader exception; included in `licenses/pyinstaller.txt`.

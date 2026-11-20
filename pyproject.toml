@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "An experimental offline project planner"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["PySide6-Essentials>=6.8,<6.13", "pymppwriter==0.4.3", "openai>=3.51,<4", "keyring>=25.7,<26"]
+dependencies = ["PySide6-Essentials>=6.8,<6.13", "pymppwriter @ git+https://github.com/acowls/pymppwriter.git@53e396b3437bc3fc9e4a66abd696a1c2cd015e9c","openai>=3.51,<4", "keyring>=25.7,<26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pyinstaller>=6", "pypdf>=5,<8"]

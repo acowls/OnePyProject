@@ -1898,3 +1898,98 @@ def test_save_as_mpp_creates_copy_without_changing_working_save(app, tmp_path, m
     original = written.read_bytes()
     window.save_as()
     assert warnings and "does not overwrite" in warnings[-1] and written.read_bytes() == original
+
+
+def test_fixed_units_edits_recalculate_the_other_value(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Staffed", duration=2, resource="Alex"), Task(2, "Unstaffed", mode="units", duration=2)])
+    window.reset_history(saved=True)
+    window.refresh()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.edit_cell(1, 8, "units")
+    task = window.plan.tasks[0]
+    assert task.mode == "units" and window.items[1].text(8) == "Units"
+    assert window.can_edit_cell(task, 2) and window.can_edit_cell(task, 7)
+    window.edit_cell(1, 7, "24 h")                       # work drives duration
+    assert window.plan.tasks[0].duration == 3 and window.calculated[1].work == 24
+    window.edit_cell(1, 2, "4")                          # duration drives work
+    assert window.calculated[1].work == 32 and window.plan.tasks[0].mode == "units"
+    window.edit_cell(1, 8, "work")                       # keeps the calculated work
+    assert window.plan.tasks[0].work == 32
+    window.edit_cell(1, 8, "units")                      # and the calculated duration coming back
+    assert window.plan.tasks[0].duration == 4
+    # Nothing assigned, so work cannot determine a duration.
+    assert window.can_edit_cell(window.plan.tasks[1], 2) and not window.can_edit_cell(window.plan.tasks[1], 7)
+    window.edit_cell(1, 8, "nonsense")
+    assert errors and window.plan.tasks[0].mode == "units"
+
+
+def test_summary_predecessors_are_editable_and_finish_links_are_refused(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3), Task(2, "Phase"), Task(3, "Child", parent=2, duration=1)])
+    window.reset_history(saved=True)
+    window.refresh()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    assert window.can_edit_cell(window.plan.tasks[1], 5) and not window.can_edit_cell(window.plan.tasks[1], 2)
+    window.edit_cell(2, 5, "1")
+    assert window.plan.tasks[1].predecessors == [1]
+    assert window.calculated[3].start.date().isoformat() == "2026-11-19"
+    window.edit_cell(2, 5, "1FF")
+    assert errors and "FS and SS" in errors[-1] and window.plan.tasks[1].predecessors == [1]
+
+
+def test_task_dialog_offers_fixed_units_and_work_edit_changes_duration(app):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Staffed", mode="units", duration=2, resource="Alex")])
+    dialog = TaskDialog(plan.tasks[0], plan)
+    assert [dialog.mode.itemData(i) for i in range(dialog.mode.count())] == ["duration", "work", "units"]
+    assert dialog.mode.currentData() == "units" and dialog.work.value() == 16
+    dialog.work.setValue(40)
+    dialog.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].mode == "units" and plan.tasks[0].duration == 5
+    # Editing both fields keeps the duration that was typed.
+    again = TaskDialog(plan.tasks[0], plan)
+    again.duration.setValue(2)
+    again.work.setValue(80)
+    again.apply(plan.tasks[0], plan)
+    assert plan.tasks[0].duration == 2
+
+
+def test_task_dialog_fixes_a_start_and_a_blank_date_holds_the_calculated_start(app):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Lead in", duration=3),
+                                           Task(2, "Follow-on", duration=2, predecessors=[1])])
+    dialog = TaskDialog(plan.tasks[1], plan)
+    assert [dialog.start_mode.itemData(i) for i in range(dialog.start_mode.count())] == ["no_earlier", "fixed"]
+    assert dialog.start_mode.currentData() == "no_earlier"
+    dialog.start_mode.setCurrentIndex(dialog.start_mode.findData("fixed"))
+    dialog.apply(plan.tasks[1], plan)
+    # With no date typed, fixing the start holds the date the task has now.
+    assert (plan.tasks[1].start_mode, plan.tasks[1].earliest) == ("fixed", "2026-11-19")
+    again = TaskDialog(plan.tasks[1], plan)
+    assert again.start_mode.currentData() == "fixed" and again.earliest.text() == "2026-11-19"
+    again.earliest.setText("2026-11-17")
+    again.apply(plan.tasks[1], plan)
+    assert schedule(plan)[2].start.date().isoformat() == "2026-11-17"
+
+
+def test_start_cell_keeps_a_fixed_start_and_clearing_it_releases_it(app, monkeypatch):
+    window = MainWindow()
+    window.plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Follow-on", duration=2, predecessors=[1], earliest="2026-11-17", start_mode="fixed")])
+    window.refresh()
+    assert window.calculated[2].start.date().isoformat() == "2026-11-17"
+    assert set(window.fixed_conflicts) == {2}
+    tip = window.items[2].toolTip(3)
+    assert "Fixed start" in tip and "2026-11-19" in tip
+    assert "Edit the earliest allowed start" in window.items[1].toolTip(3)   # an ordinary task is unchanged
+    window.edit_cell(2, 3, "2026-11-18")                       # moving the date keeps the start fixed
+    assert window.plan.tasks[1].start_mode == "fixed" and window.calculated[2].start.date().isoformat() == "2026-11-18"
+    window.edit_cell(2, 3, "")                                 # clearing it releases the fixed start
+    assert (window.plan.tasks[1].earliest, window.plan.tasks[1].start_mode) == ("", "no_earlier")
+    assert window.calculated[2].start.date().isoformat() == "2026-11-19"
+    assert not window.fixed_conflicts
+    assert "Fixed start" not in window.items[2].toolTip(3)
