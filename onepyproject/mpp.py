@@ -74,6 +74,11 @@ def _mpp_relation_records(path: str | Path) -> list[tuple[int, int, int, int, in
     return result
 
 
+def _link_text(value) -> str:
+    """Describe a stored dependency without its task ID, e.g. FS or SS+2d."""
+    return re.sub(r"^\d+", "", str(value)) or "FS"
+
+
 def _mpp_resource_values(path: str | Path):
     """Read raw percentages: pymppwriter 0.4.3 maps stored zero to 100%."""
     from pymppwriter import blocks
@@ -180,7 +185,19 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
             continue
         # A zero lag needs no unit; use days, as the export does.
         unit_name, tenths = WORKING_LAG_UNITS.get(unit, ("d", 4800))
-        links.setdefault(succ, []).append(format_dependency(Dependency(pred, rel.type, raw_lag / tenths, unit_name)))
+        link = format_dependency(Dependency(pred, rel.type, raw_lag / tenths, unit_name))
+        # A task can have one link to each predecessor. A file can still hold several records for the
+        # same pair, so identical ones merge and a different one is reported and left out.
+        kept = links.setdefault(succ, [])
+        earlier = next((item for item in kept if parse_dependency(item).uid == pred), None)
+        if earlier is None:
+            kept.append(link)
+        elif str(earlier) == str(link):
+            notes.append(f"Task {numbers.get(succ, f'UID {succ}')}: merged duplicate dependency on "
+                         f"{numbers.get(pred, f'UID {pred}')}")
+        else:
+            notes.append(f"Task {numbers.get(succ, f'UID {succ}')}: omitted a second dependency on "
+                         f"{numbers.get(pred, f'UID {pred}')} ({_link_text(link)}); kept {_link_text(earlier)}")
     ids = {task.uid for task in source.tasks}
     summary_ids = {task.parent_uid for task in source.tasks if task.parent_uid}
     pin_reasons: dict[int, str] = {}

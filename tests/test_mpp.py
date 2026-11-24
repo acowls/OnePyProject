@@ -578,3 +578,42 @@ def test_import_accepts_a_zero_lag_whatever_its_unit(tmp_path, monkeypatch):
     plan, notes = import_mpp(tmp_path / "ignored.mpp")
     assert plan.tasks[1].predecessors == [1]
     assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_merges_identical_duplicate_links(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    # A real file held two identical finish-to-start records between the same two tasks.
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: merged duplicate dependency on 1" in notes
+    assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_keeps_the_first_of_differing_duplicate_links_and_says_so(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="SS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 2, 7, 9600)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: omitted a second dependency on 1 (SS+2d); kept FS" in notes
+
+
+def test_import_keeps_links_to_different_predecessors(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=3, type="FS"), NS(pred_uid=2, succ_uid=3, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-16"),
+                            _source_task(3, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 3, 1, 7, 0), (2, 3, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[2].predecessors == [1, 2]
+    assert not [note for note in notes if "duplicate" in note]
