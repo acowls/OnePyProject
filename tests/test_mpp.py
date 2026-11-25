@@ -529,3 +529,91 @@ def test_export_writes_fixed_starts_as_constraints_and_drops_their_false_warning
         "task 3 'Floor' starts 2026-11-17 08:00 but its predecessors put it at 2026-11-19 08:00; "
         "Project will move it",
     ]
+
+
+@pytest.mark.parametrize("unit, raw, expected", [
+    (3, 150, "1FS+15m"),
+    (5, 6000, "1FS+10h"),
+    (7, -4800, "1FS-1d"),
+    (9, -216000, "1FS-9w"),            # a nine-week lead, as in a real file
+    (9, -48000, "1FS-2w"),
+    (11, 96000, "1FS+1mo"),
+])
+def test_import_keeps_working_time_lags_in_the_unit_the_file_shows(tmp_path, monkeypatch, unit, raw, expected):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+    from onepyproject.dependencies import lag_minutes
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, unit, raw)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [expected]
+    assert not [note for note in notes if "omitted" in note]
+    # The scheduler must read the lag as the same working minutes the file stores (tenths of a minute).
+    minutes, elapsed = lag_minutes(parse_dependency(plan.tasks[1].predecessors[0]), 0)
+    assert minutes == pytest.approx(raw / 10) and not elapsed
+
+
+@pytest.mark.parametrize("unit", [4, 6, 8, 10, 12, 19, 20])
+def test_import_still_omits_lags_that_are_not_working_time(tmp_path, monkeypatch, unit):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, unit, 4800)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert not plan.tasks[1].predecessors
+    assert f"Task 2: omitted dependency 1 with unsupported MPP link type or lag unit ({unit})" in notes
+
+
+def test_import_accepts_a_zero_lag_whatever_its_unit(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 8, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_merges_identical_duplicate_links(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    # A real file held two identical finish-to-start records between the same two tasks.
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: merged duplicate dependency on 1" in notes
+    assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_keeps_the_first_of_differing_duplicate_links_and_says_so(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="SS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 2, 7, 9600)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: omitted a second dependency on 1 (SS+2d); kept FS" in notes
+
+
+def test_import_keeps_links_to_different_predecessors(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=3, type="FS"), NS(pred_uid=2, succ_uid=3, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-16"),
+                            _source_task(3, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 3, 1, 7, 0), (2, 3, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[2].predecessors == [1, 2]
+    assert not [note for note in notes if "duplicate" in note]

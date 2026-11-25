@@ -33,6 +33,10 @@ IMPORT_WARNING = (
     "Keep the original MPP and verify the imported schedule."
 )
 EXPORT_TASK_TYPES = {"duration": "fixed_duration", "work": "fixed_work", "units": "fixed_units"}
+# Project stores every lag as working tenths of a minute; the unit code only says how it is
+# displayed. These units therefore read exactly like days, keeping the unit the file shows.
+# Elapsed (4, 6, 8, 10, 12) and percentage (19, 20) units are not working time and stay omitted.
+WORKING_LAG_UNITS = {3: ("m", 10), 5: ("h", 600), 7: ("d", 4800), 9: ("w", 24000), 11: ("mo", 96000)}
 EXPORT_WARNING = (
     "An empty MPP template is required to save this project as an MPP. "
     "Some metadata may be retained from the template in the saved file.\n\n"
@@ -68,6 +72,11 @@ def _mpp_relation_records(path: str | Path) -> list[tuple[int, int, int, int, in
             lag = struct.unpack_from("<i", record, 16 if old_layout else 14)[0]
             result.append((pred, succ, kind, unit, lag))
     return result
+
+
+def _link_text(value) -> str:
+    """Describe a stored dependency without its task ID, e.g. FS or SS+2d."""
+    return re.sub(r"^\d+", "", str(value)) or "FS"
 
 
 def _mpp_resource_values(path: str | Path):
@@ -169,12 +178,26 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
     for rel, (pred, succ, kind, unit, raw_lag) in zip(source.relations, records):
         if (pred, succ) != (rel.pred_uid, rel.succ_uid):
             raise ValueError("Cannot safely match the MPP dependencies")
-        if kind not in (0, 1, 2, 3) or (raw_lag and unit != 7):
+        if kind not in (0, 1, 2, 3) or (raw_lag and unit not in WORKING_LAG_UNITS):
             successor = numbers.get(succ, f"UID {succ}")
             predecessor = numbers.get(pred, f"UID {pred}")
             notes.append(f"Task {successor}: omitted dependency {predecessor} with unsupported MPP link type or lag unit ({unit})")
             continue
-        links.setdefault(succ, []).append(format_dependency(Dependency(pred, rel.type, raw_lag / 4800, "d")))
+        # A zero lag needs no unit; use days, as the export does.
+        unit_name, tenths = WORKING_LAG_UNITS.get(unit, ("d", 4800))
+        link = format_dependency(Dependency(pred, rel.type, raw_lag / tenths, unit_name))
+        # A task can have one link to each predecessor. A file can still hold several records for the
+        # same pair, so identical ones merge and a different one is reported and left out.
+        kept = links.setdefault(succ, [])
+        earlier = next((item for item in kept if parse_dependency(item).uid == pred), None)
+        if earlier is None:
+            kept.append(link)
+        elif str(earlier) == str(link):
+            notes.append(f"Task {numbers.get(succ, f'UID {succ}')}: merged duplicate dependency on "
+                         f"{numbers.get(pred, f'UID {pred}')}")
+        else:
+            notes.append(f"Task {numbers.get(succ, f'UID {succ}')}: omitted a second dependency on "
+                         f"{numbers.get(pred, f'UID {pred}')} ({_link_text(link)}); kept {_link_text(earlier)}")
     ids = {task.uid for task in source.tasks}
     summary_ids = {task.parent_uid for task in source.tasks if task.parent_uid}
     pin_reasons: dict[int, str] = {}
