@@ -173,6 +173,7 @@ def test_selected_mention_is_sent_as_plain_prompt(assistant, app, monkeypatch):
     assistant.window.preferences.setValue("ai/endpoint", config.endpoint)
     assistant.window.preferences.setValue("ai/deployment", config.deployment)
     assistant.session_endpoint, assistant.session_key = config.endpoint, "secret"
+    assistant.session_provider = "foundry"
     monkeypatch.setattr(ConsentDialog, "exec", lambda dialog: QDialog.DialogCode.Accepted)
     received = []
     def provider(config, key, snapshot, prompt, **kwargs):

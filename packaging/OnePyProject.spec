@@ -13,6 +13,8 @@ datas = [
 datas += collect_data_files("pymppwriter")
 datas += copy_metadata("pymppwriter") + copy_metadata("olefile")
 datas += copy_metadata("openai", recursive=True) + copy_metadata("keyring", recursive=True)
+datas += copy_metadata("google-auth", recursive=True)
+datas += copy_metadata("requests", recursive=True)
 
 hiddenimports = ["PySide6.QtSvg"]
 if sys.platform == "darwin":

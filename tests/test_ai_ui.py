@@ -62,6 +62,7 @@ def configured(window):
     window.preferences.setValue("ai/endpoint", config.endpoint)
     window.preferences.setValue("ai/deployment", config.deployment)
     assistant.session_endpoint, assistant.session_key = config.endpoint, "secret"
+    assistant.session_provider = "foundry"
     return assistant, config
 
 
@@ -129,6 +130,46 @@ def test_settings_saves_multiple_deployments_for_model_picker(app, tmp_path):
     dialog.accept()
     reopened = AISettingsDialog(preferences, FakeCredentials())
     assert reopened.deployments.toPlainText().splitlines() == ["primary", "secondary", "third"]
+
+
+def test_gemini_settings_save_provider_without_storing_access_tokens(app, tmp_path):
+    path = tmp_path / "settings.ini"
+    preferences = QSettings(str(path), QSettings.Format.IniFormat)
+    dialog = AISettingsDialog(preferences, FakeCredentials())
+    dialog.provider.setCurrentIndex(dialog.provider.findData("gemini"))
+    dialog.project.setText("onepyproject-123")
+    dialog.location.setText("global")
+    dialog.gemini_model.setText("google/gemini-3.5-flash")
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert preferences.value("ai/provider") == "gemini"
+    assert preferences.value("ai/gemini/project") == "onepyproject-123"
+    assert preferences.value("ai/gemini/location") == "global"
+    assert preferences.value("ai/gemini/model") == "google/gemini-3.5-flash"
+    assert "access-token" not in path.read_text(encoding="utf-8")
+    assert not dialog.google_login.isHidden() and dialog.endpoint.isHidden()
+
+
+def test_gemini_provider_routes_request_through_google_adapter(window, monkeypatch, app):
+    window.preferences.setValue("ai/provider", "gemini")
+    window.preferences.setValue("ai/gemini/project", "onepyproject-123")
+    window.preferences.setValue("ai/gemini/location", "global")
+    window.preferences.setValue("ai/gemini/model", "google/gemini-3.5-flash")
+    window.open_ai()
+    assistant = window._ai_dialog
+    monkeypatch.setattr(ConsentDialog, "exec", lambda dialog: QDialog.DialogCode.Accepted)
+    calls = []
+    def provider(config, snapshot, prompt, **kwargs):
+        calls.append((config, prompt, kwargs))
+        return AIResult("Need details", True, None, None)
+    monkeypatch.setattr("onepyproject.ai.ui.request_gemini_proposal", provider)
+    assistant.prompt.setPlainText("What is the next milestone?")
+    assistant.start_request()
+    finish(assistant, app)
+    assert len(calls) == 1
+    assert calls[0][0].project == "onepyproject-123" and calls[0][0].location == "global"
+    assert calls[0][0].model == "google/gemini-3.5-flash"
+    assert calls[0][1] == "What is the next milestone?"
 
 
 def test_settings_clear_cancelled_key_and_forget_session(window, monkeypatch):

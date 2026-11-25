@@ -17,6 +17,8 @@ image-format and platform plugins; those need their own distribution audit.
 - PyInstaller: GPL with a bootloader exception; included in `licenses/pyinstaller.txt`.
 - OpenAI Python SDK: Apache 2.0; included in `licenses/openai.txt`.
 - Python keyring: MIT; included in `licenses/keyring.txt`.
+- Google Auth library: Apache 2.0; included in `licenses/google-auth.txt`.
+- Requests: Apache 2.0; included in `licenses/requests.txt`.
 - Additional SDK and credential-store dependencies have their own licences; their distribution metadata is included in the app and requires review.
 - Python has its own licences: https://docs.python.org/3/license.html.
 

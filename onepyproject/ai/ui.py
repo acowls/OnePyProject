@@ -3,19 +3,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QProcess, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox, QDockWidget, QFormLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
+                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
+                               QPushButton, QToolButton, QVBoxLayout, QWidget)
 
 from .diff import compare_plans
 from .mentions import ResourceMentionEdit
 from .proposals import ProposalError, make_snapshot, plan_revision
 from .provider import (DEFAULT_BASE_PROMPT, EFFORTS, MAX_BASE_PROMPT, CredentialStore, ProviderError, discover_models,
-                       normalize_config, request_proposal, validate_api_key)
+                       normalize_config, normalize_gemini_config, request_gemini_proposal, request_proposal,
+                       validate_api_key)
 
 
 def _model_key(endpoint):
@@ -38,6 +43,24 @@ def _models(preferences, config):
         if name not in valid:
             valid.append(name)
     return valid
+
+
+def _provider(preferences):
+    value = preferences.value("ai/provider", "foundry", type=str)
+    return value if value in ("foundry", "gemini") else "foundry"
+
+
+def _current_config(preferences):
+    if _provider(preferences) == "gemini":
+        return normalize_gemini_config(preferences.value("ai/gemini/project", "", type=str),
+                                       preferences.value("ai/gemini/location", "global", type=str),
+                                       preferences.value("ai/gemini/model", "", type=str))
+    return normalize_config(preferences.value("ai/endpoint", "", type=str),
+                            preferences.value("ai/deployment", "", type=str))
+
+
+def _model_name(config):
+    return config.model if hasattr(config, "model") else config.deployment
 
 
 def _icon(name):
@@ -65,10 +88,15 @@ class AISettingsDialog(QDialog):
         self.preferences, self.credentials = preferences, credentials
         self.session_key, self.config = "", None
         self.setWindowTitle("AI settings")
-        self.resize(650, 450)
+        self.resize(650, 560)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.provider = QComboBox()
+        self.provider.addItem("Azure AI Foundry", "foundry")
+        self.provider.addItem("Gemini Enterprise (Google Cloud)", "gemini")
+        self.provider.setCurrentIndex(max(0, self.provider.findData(_provider(preferences))))
+        form.addRow("AI provider", self.provider)
         self.endpoint = QLineEdit(preferences.value("ai/endpoint", "", type=str))
         self.endpoint.setPlaceholderText("https://YOUR-RESOURCE.openai.azure.com/openai/v1/")
         self.deployment = QLineEdit(preferences.value("ai/deployment", "", type=str))
@@ -80,12 +108,27 @@ class AISettingsDialog(QDialog):
             field.setMinimumHeight(field.sizeHint().height())
             _readable_placeholder(field)
         self.remember = QCheckBox("Remember the key in the operating-system credential store")
-        form.addRow("Foundry endpoint", self.endpoint)
-        form.addRow("Deployment", self.deployment)
-        form.addRow("API key", self.key)
-        form.addRow("", self.remember)
+        self.foundry_rows = []
+        for label, widget in (("Foundry endpoint", self.endpoint), ("Deployment", self.deployment),
+                              ("API key", self.key), ("", self.remember)):
+            form.addRow(label, widget)
+            self.foundry_rows.append((form.labelForField(widget), widget))
+        self.project = QLineEdit(preferences.value("ai/gemini/project", "", type=str))
+        self.project.setPlaceholderText("your-google-cloud-project")
+        self.location = QLineEdit(preferences.value("ai/gemini/location", "global", type=str))
+        self.location.setPlaceholderText("global or us-central1")
+        self.gemini_model = QLineEdit(preferences.value("ai/gemini/model", "google/gemini-3.5-flash", type=str))
+        self.gemini_model.setPlaceholderText("google/gemini-3.5-flash")
+        self.gemini_rows = []
+        for label, widget in (("Google Cloud project ID", self.project), ("Location", self.location),
+                              ("Gemini model", self.gemini_model)):
+            widget.setMinimumHeight(widget.sizeHint().height())
+            _readable_placeholder(widget)
+            form.addRow(label, widget)
+            self.gemini_rows.append((form.labelForField(widget), widget))
         layout.addLayout(form)
-        layout.addWidget(QLabel("Additional deployment names (one per line):"))
+        self.deployments_label = QLabel("Additional deployment names (one per line):")
+        layout.addWidget(self.deployments_label)
         self.deployments = QPlainTextEdit()
         self.deployments.setMaximumHeight(80)
         try:
@@ -94,13 +137,24 @@ class AISettingsDialog(QDialog):
         except ProviderError:
             pass
         layout.addWidget(self.deployments)
-        note = QLabel("API-key authentication only. A new key is session-only unless remembered. "
-                      "An existing saved key remains until forgotten.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        forget = QPushButton("Forget saved key")
-        forget.clicked.connect(self.forget_key)
-        layout.addWidget(forget, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.provider_note = QLabel()
+        self.provider_note.setWordWrap(True)
+        layout.addWidget(self.provider_note)
+        self.google_login = QPushButton("Sign in with Google (SSO)…")
+        self.google_login.clicked.connect(self.login_google)
+        layout.addWidget(self.google_login, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.google_status = QLabel()
+        self.google_status.setWordWrap(True)
+        layout.addWidget(self.google_status)
+        self.forget_button = QPushButton("Forget saved key")
+        self.forget_button.clicked.connect(self.forget_key)
+        layout.addWidget(self.forget_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.google_process = QProcess(self)
+        self.google_process.readyReadStandardOutput.connect(self._discard_google_output)
+        self.google_process.readyReadStandardError.connect(self._discard_google_output)
+        self.google_process.finished.connect(self._google_login_finished)
+        self.google_process.errorOccurred.connect(self._google_login_error)
+        self.provider.currentIndexChanged.connect(self._provider_changed)
         label = QLabel("Base planning prompt (appended after fixed safety instructions)")
         label.setWordWrap(True)
         layout.addWidget(label)
@@ -108,9 +162,84 @@ class AISettingsDialog(QDialog):
         self.base_prompt.setAccessibleName("Base planning prompt")
         layout.addWidget(self.base_prompt)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._provider_changed()
+
+    def _provider_changed(self, *_):
+        is_gemini = self.provider.currentData() == "gemini"
+        for label, widget in self.foundry_rows:
+            if label is not None:
+                label.setVisible(not is_gemini)
+            widget.setVisible(not is_gemini)
+        for label, widget in self.gemini_rows:
+            if label is not None:
+                label.setVisible(is_gemini)
+            widget.setVisible(is_gemini)
+        for widget in (self.deployments_label, self.deployments, self.forget_button):
+            widget.setVisible(not is_gemini)
+        self.google_login.setVisible(is_gemini)
+        self.google_status.setVisible(is_gemini and bool(self.google_status.text()))
+        self.provider_note.setText(
+            "Uses an API key. A new key is session-only unless remembered; an existing saved key remains until forgotten."
+            if not is_gemini else
+            "Uses Google Cloud user credentials (ADC); the access token is refreshed for each request and is not saved by OnePyProject. "
+            "Gemini Enterprise Agent Platform and Vertex AI permissions must be enabled for this project.")
+
+    @staticmethod
+    def _google_cli():
+        if executable := shutil.which("gcloud"):
+            return executable
+        candidates = [Path.home() / "google-cloud-sdk" / "bin" / "gcloud"]
+        if sys.platform == "darwin":
+            candidates.extend((Path("/opt/homebrew/bin/gcloud"), Path("/usr/local/bin/gcloud")))
+        elif sys.platform == "win32":
+            root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Google" / "Cloud SDK" / "google-cloud-sdk" / "bin"
+            candidates.extend((root / "gcloud.cmd", root / "gcloud.exe"))
+        return next((str(path) for path in candidates if path.is_file()), None)
+
+    def login_google(self):
+        if self.google_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        executable = self._google_cli()
+        if not executable:
+            self.google_status.setText("Google Cloud CLI (gcloud) was not found. Install it, then restart OnePyProject.")
+            self.google_status.setVisible(True)
+            return
+        arguments = ["auth", "application-default", "login", "--quiet",
+                     "--scopes=https://www.googleapis.com/auth/cloud-platform"]
+        self.google_login.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.google_status.setText("Opening Google sign-in in your browser…")
+        self.google_status.setVisible(True)
+        if sys.platform == "win32" and executable.lower().endswith((".cmd", ".bat")):
+            import subprocess
+            command = subprocess.list2cmdline([executable, *arguments])
+            self.google_process.start(os.environ.get("COMSPEC", "cmd.exe"), ["/d", "/s", "/c", command])
+        else:
+            self.google_process.start(executable, arguments)
+
+    def _discard_google_output(self):
+        self.google_process.readAllStandardOutput()
+        self.google_process.readAllStandardError()
+
+    def _google_login_finished(self, exit_code, exit_status):
+        self.google_login.setEnabled(True)
+        self.save_button.setEnabled(True)
+        if exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0:
+            self.google_status.setText("Google sign-in completed. Save these settings, then send a request.")
+        else:
+            self.google_status.setText("Google sign-in did not complete. Check Google Cloud CLI and try again.")
+        self.google_status.setVisible(True)
+
+    def _google_login_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.google_login.setEnabled(True)
+            self.save_button.setEnabled(True)
+            self.google_status.setText("Could not start Google Cloud CLI. Install gcloud and try again.")
+            self.google_status.setVisible(True)
 
     def forget_key(self):
         try:
@@ -128,26 +257,39 @@ class AISettingsDialog(QDialog):
 
     def accept(self):
         try:
-            config = normalize_config(self.endpoint.text(), self.deployment.text())
-            key = self.key.text().strip()
-            if key:
-                key = validate_api_key(key)
+            provider = self.provider.currentData()
+            if provider == "gemini":
+                config = normalize_gemini_config(self.project.text(), self.location.text(), self.gemini_model.text())
+                key = ""
+            else:
+                config = normalize_config(self.endpoint.text(), self.deployment.text())
+                key = self.key.text().strip()
+                if key:
+                    key = validate_api_key(key)
             base_prompt = self.base_prompt.toPlainText()
             if len(base_prompt) > MAX_BASE_PROMPT:
                 raise ProviderError("The base AI prompt must be at most 4,000 characters.")
-            names = [config.deployment]
-            for name in self.deployments.toPlainText().splitlines():
-                if name.strip():
-                    name = normalize_config(config.endpoint, name).deployment
-                    if name not in names:
-                        names.append(name)
-            if len(names) > 500:
-                raise ProviderError("At most 500 deployment names can be saved.")
-            if key and self.remember.isChecked():
-                self.credentials.set(config, key)
-            self.preferences.setValue("ai/endpoint", config.endpoint)
-            self.preferences.setValue("ai/deployment", config.deployment)
-            self.preferences.setValue(_model_key(config.endpoint), json.dumps(names))
+            names = None
+            if provider == "foundry":
+                names = [config.deployment]
+                for name in self.deployments.toPlainText().splitlines():
+                    if name.strip():
+                        name = normalize_config(config.endpoint, name).deployment
+                        if name not in names:
+                            names.append(name)
+                if len(names) > 500:
+                    raise ProviderError("At most 500 deployment names can be saved.")
+                if key and self.remember.isChecked():
+                    self.credentials.set(config, key)
+            self.preferences.setValue("ai/provider", provider)
+            if provider == "gemini":
+                self.preferences.setValue("ai/gemini/project", config.project)
+                self.preferences.setValue("ai/gemini/location", config.location)
+                self.preferences.setValue("ai/gemini/model", config.model)
+            else:
+                self.preferences.setValue("ai/endpoint", config.endpoint)
+                self.preferences.setValue("ai/deployment", config.deployment)
+                self.preferences.setValue(_model_key(config.endpoint), json.dumps(names))
             self.preferences.setValue("ai/base_prompt", base_prompt)
             self.preferences.sync()
             if self.preferences.status() != QSettings.Status.NoError:
@@ -160,17 +302,25 @@ class AISettingsDialog(QDialog):
 
 
 class ConsentDialog(QDialog):
-    def __init__(self, config, parent=None):
+    def __init__(self, config, parent=None, provider="foundry"):
         super().__init__(parent)
         self.setWindowTitle("AI data sharing")
         self.resize(560, 220)
         layout = QVBoxLayout(self)
-        note = QLabel(f"Requests to {config.endpoint} (deployment {config.deployment}) send the project snapshot, "
+        if provider == "gemini":
+            destination = (f"Google Gemini Enterprise Agent Platform (project {config.project}, location "
+                           f"{config.location}, model {config.model})")
+            authentication = "Your Google Cloud access token authenticates the connection"
+            disclosure_target = "for this Google Cloud project, location, and model"
+        else:
+            destination = f"{config.endpoint} (deployment {config.deployment})"
+            authentication = "Your API key authenticates the connection"
+            disclosure_target = "for this endpoint and deployment"
+        note = QLabel(f"Requests to {destination} send the project snapshot, "
                       "including names, resources, assignments and dates, your base prompt, request and session "
                       "conversation. Refinements include the staged proposal. No project files are attached. "
-                      "The service may charge and apply its own retention or monitoring policies. Your API key "
-                      "authenticates the connection but is not part of the model prompt. This disclosure is "
-                      "shown once for this endpoint and deployment.")
+                      f"The service may charge and apply its own retention or monitoring policies. {authentication} "
+                      f"but is not part of the model prompt. This disclosure is shown once {disclosure_target}.")
         note.setWordWrap(True)
         note.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(note)
@@ -196,6 +346,7 @@ class AIAssistantDock(QDockWidget):
         self.window = window
         self.credentials = CredentialStore()
         self.session_endpoint = self.session_key = ""
+        self.session_provider = ""
         self._signals = _WorkerSignals(self)
         self._signals.finished.connect(self._finished)
         self._signals.discovered.connect(self._models_discovered)
@@ -278,7 +429,7 @@ class AIAssistantDock(QDockWidget):
         controls.addStretch()
         self.model_button = QToolButton()
         self.model_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.model_button.setAccessibleName("Select model deployment")
+        self.model_button.setAccessibleName("Select AI model")
         self.model_menu = QMenu(self.model_button)
         self.model_menu.aboutToShow.connect(self._populate_models)
         self.model_button.setMenu(self.model_menu)
@@ -286,11 +437,9 @@ class AIAssistantDock(QDockWidget):
         self.effort_button = QToolButton()
         self.effort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.effort_button.setAccessibleName("Select reasoning effort")
-        effort_menu = QMenu(self.effort_button)
-        for effort in (None, *EFFORTS):
-            action = effort_menu.addAction(effort or "Model default")
-            action.triggered.connect(lambda checked=False, value=effort: self.select_effort(value))
-        self.effort_button.setMenu(effort_menu)
+        self.effort_menu = QMenu(self.effort_button)
+        self.effort_menu.aboutToShow.connect(self._populate_efforts)
+        self.effort_button.setMenu(self.effort_menu)
         controls.addWidget(self.effort_button)
         self.send = QToolButton()
         self.send.setIconSize(QSize(20, 20))
@@ -305,9 +454,15 @@ class AIAssistantDock(QDockWidget):
         self.response.appendPlainText(f"{who}:\n{text}\n")
 
     def _update_controls(self):
-        model = self.window.preferences.value("ai/deployment", "", type=str)
+        try:
+            config = _current_config(self.window.preferences)
+            model = _model_name(config)
+        except ProviderError:
+            model = ""
         self.model_button.setText(self.model_button.fontMetrics().elidedText(model or "Choose model", Qt.TextElideMode.ElideRight, 110))
-        self.model_button.setToolTip(f"Select a Foundry deployment: {model}" if model else "Select a Foundry deployment")
+        provider = _provider(self.window.preferences)
+        self.model_button.setToolTip(f"Select a {('Gemini model' if provider == 'gemini' else 'Foundry deployment')}: {model}"
+                                     if model else "Choose a model in AI settings")
         self.effort_button.setText(self.effort or "default")
         self.effort_button.setToolTip("Reasoning effort (availability varies by model)")
         mode = "Auto-accept" if self.auto_accept else "Ask before applying"
@@ -335,15 +490,32 @@ class AIAssistantDock(QDockWidget):
 
     def select_effort(self, value):
         if not self._busy:
+            if _provider(self.window.preferences) == "gemini" and value in ("none", "xhigh"):
+                return
             self.effort = value
             self._update_controls()
+
+    def _populate_efforts(self):
+        self.effort_menu.clear()
+        efforts = EFFORTS if _provider(self.window.preferences) == "foundry" else ("minimal", "low", "medium", "high")
+        for effort in (None, *efforts):
+            action = self.effort_menu.addAction(effort or "Model default")
+            action.setCheckable(True)
+            action.setChecked(self.effort == effort)
+            action.triggered.connect(lambda checked=False, value=effort: self.select_effort(value))
 
     def _populate_models(self):
         menu = self.model_menu
         menu.clear()
         try:
-            config = normalize_config(self.window.preferences.value("ai/endpoint", "", type=str),
-                                      self.window.preferences.value("ai/deployment", "", type=str))
+            config = _current_config(self.window.preferences)
+            if _provider(self.window.preferences) == "gemini":
+                current = menu.addAction(config.model)
+                current.setCheckable(True)
+                current.setChecked(True)
+                menu.addSeparator()
+                menu.addAction("Manage Gemini settings…").triggered.connect(self.open_settings)
+                return
             names = _models(self.window.preferences, config)
             for name in names:
                 action = menu.addAction(name)
@@ -369,6 +541,16 @@ class AIAssistantDock(QDockWidget):
         if self._busy:
             return
         try:
+            if _provider(self.window.preferences) == "gemini":
+                config = normalize_gemini_config(self.window.preferences.value("ai/gemini/project", "", type=str),
+                                                 self.window.preferences.value("ai/gemini/location", "global", type=str), name)
+                self.window.preferences.setValue("ai/gemini/model", config.model)
+                self.window.preferences.sync()
+                if self.window.preferences.status() != QSettings.Status.NoError:
+                    raise ProviderError("Could not save the selected Gemini model.")
+                self.effort = None
+                self._update_controls()
+                return
             config = normalize_config(self.window.preferences.value("ai/endpoint", "", type=str), name)
             previous = self.window.preferences.value("ai/deployment", "", type=str)
             try:
@@ -391,8 +573,9 @@ class AIAssistantDock(QDockWidget):
         if self._discovering or self._busy:
             return
         try:
-            config = normalize_config(self.window.preferences.value("ai/endpoint", "", type=str),
-                                      self.window.preferences.value("ai/deployment", "", type=str))
+            if _provider(self.window.preferences) == "gemini":
+                raise ProviderError("Gemini model IDs are set in AI settings; model discovery is not available.")
+            config = _current_config(self.window.preferences)
             key = self.session_key if self.session_endpoint == config.endpoint else ""
             key = validate_api_key(key or self.credentials.get(config) or "")
         except ProviderError as exc:
@@ -426,8 +609,10 @@ class AIAssistantDock(QDockWidget):
         dialog.forgotten.connect(self._forget_session)
         try:
             if dialog.exec() == QDialog.DialogCode.Accepted:
-                if self.session_endpoint != dialog.config.endpoint:
+                provider = _provider(self.window.preferences)
+                if self.session_provider != provider or self.session_endpoint != dialog.config.endpoint:
                     self.session_key = ""
+                self.session_provider = provider
                 self.session_endpoint = dialog.config.endpoint
                 if dialog.session_key:
                     self.session_key = dialog.session_key
@@ -464,8 +649,9 @@ class AIAssistantDock(QDockWidget):
         self._update_controls()
 
     @staticmethod
-    def _consent_key(config):
-        identity = (config.endpoint + "\n" + config.deployment).encode("utf-8")
+    def _consent_key(config, provider="foundry"):
+        model = _model_name(config)
+        identity = (f"{provider}\n{config.endpoint}\n{model}").encode("utf-8")
         return "ai/disclosure/" + hashlib.sha256(identity).hexdigest()
 
     def start_request(self):
@@ -479,12 +665,15 @@ class AIAssistantDock(QDockWidget):
             self.status.setText("Enter a request of at most 4,000 characters.")
             return
         try:
-            config = normalize_config(self.window.preferences.value("ai/endpoint", "", type=str),
-                                      self.window.preferences.value("ai/deployment", "", type=str))
-            key = self.session_key if self.session_endpoint == config.endpoint else ""
-            if not key:
-                key = self.credentials.get(config) or ""
-            key = validate_api_key(key)
+            provider = _provider(self.window.preferences)
+            config = _current_config(self.window.preferences)
+            if provider == "foundry":
+                key = self.session_key if self.session_provider == provider and self.session_endpoint == config.endpoint else ""
+                if not key:
+                    key = self.credentials.get(config) or ""
+                key = validate_api_key(key)
+            else:
+                key = ""
             if (self._conversation_source is not None and
                     (self.window.plan is not self._conversation_source or
                      plan_revision(self.window.plan) != self._conversation_revision)):
@@ -503,9 +692,9 @@ class AIAssistantDock(QDockWidget):
         except (ProviderError, ProposalError, ValueError, OverflowError, RecursionError) as exc:
             self.status.setText(str(exc))
             return
-        consent_key = self._consent_key(config)
+        consent_key = self._consent_key(config, provider)
         if not self.window.preferences.value(consent_key, False, type=bool):
-            if ConsentDialog(config, self).exec() != QDialog.DialogCode.Accepted:
+            if ConsentDialog(config, self, provider=provider).exec() != QDialog.DialogCode.Accepted:
                 return
             if self.window.plan is not source or plan_revision(source) != baseline.revision:
                 self.status.setText("The project changed; request a new proposal.")
@@ -534,9 +723,14 @@ class AIAssistantDock(QDockWidget):
 
         def work():
             try:
-                result = request_proposal(config, key, snapshot, prompt, history=history, base_prompt=base_prompt,
-                                          reserved_task_ids=reserved_tasks, reserved_resource_ids=reserved_resources,
-                                          effort=effort)
+                if provider == "gemini":
+                    result = request_gemini_proposal(config, snapshot, prompt, history=history, base_prompt=base_prompt,
+                                                     reserved_task_ids=reserved_tasks,
+                                                     reserved_resource_ids=reserved_resources, effort=effort)
+                else:
+                    result = request_proposal(config, key, snapshot, prompt, history=history, base_prompt=base_prompt,
+                                              reserved_task_ids=reserved_tasks,
+                                              reserved_resource_ids=reserved_resources, effort=effort)
                 signals.finished.emit(request_id, result, "")
             except (ProviderError, ProposalError) as exc:
                 try:

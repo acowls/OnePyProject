@@ -64,8 +64,12 @@ def run():
         plan = load_plan(path)
         if [task.name for task in plan.tasks] != ["Parent", "Child", "After"]:
             raise RuntimeError("Plan did not survive a save/load round trip")
-        if not importlib.metadata.version("openai") or not importlib.metadata.version("keyring"):
+        if not all(importlib.metadata.version(name) for name in ("openai", "keyring", "google-auth", "requests")):
             raise RuntimeError("AI dependency metadata is missing")
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2.credentials import Credentials as GoogleUserCredentials
+        if not GoogleUserCredentials(token="offline-smoke-test").token or GoogleAuthRequest() is None:
+            raise RuntimeError("Google SSO authentication dependencies are unavailable")
         normalize_config("https://example.openai.azure.com", "example")
         from openai import DefaultHttpxClient, OpenAI
         client = OpenAI(base_url="https://example.openai.azure.com/openai/v1/", api_key="offline-smoke-test",
