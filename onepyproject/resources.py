@@ -4,12 +4,13 @@ from __future__ import annotations
 import copy
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 import io
 import math
 import re
 
 from .model import Plan, Resource, ResourceAssignment, Task, schedule, work_between
+from .workcalendar import work_calendar
 
 
 def migrate_legacy_resources(plan: Plan) -> None:
@@ -111,7 +112,7 @@ def overallocation_warnings(plan: Plan) -> dict[int, list[Overallocation]]:
     snapshot = copy.deepcopy(plan)
     migrate_legacy_resources(snapshot)
     calculated = schedule(snapshot)
-    holidays = {date.fromisoformat(day) for day in snapshot.holidays}
+    calendar = work_calendar(snapshot)
     events: dict[int, dict[datetime, float]] = {}
     for task in snapshot.tasks:
         item = calculated[task.uid]
@@ -128,6 +129,6 @@ def overallocation_warnings(plan: Plan) -> dict[int, list[Overallocation]]:
         for i, (start, change) in enumerate(points[:-1]):
             total += change
             finish = points[i + 1][0]
-            if total > resource.max_units + 1e-9 and work_between(start, finish, holidays) > 0:
+            if total > resource.max_units + 1e-9 and work_between(start, finish, calendar) > 0:
                 result.setdefault(resource.uid, []).append(Overallocation(start, finish, total, resource.max_units))
     return result

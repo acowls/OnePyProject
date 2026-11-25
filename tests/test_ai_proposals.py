@@ -218,3 +218,42 @@ def test_clearing_the_earliest_date_of_a_fixed_task_releases_the_fixed_start():
                                                                     earliest="2026-11-30")))
     assert (moved.tasks[1].earliest, moved.tasks[1].start_mode) == ("2026-11-30", "fixed")
     assert schedule(moved)[40].start.date().isoformat() == "2026-11-30"
+
+
+def test_snapshot_and_diff_carry_holiday_periods_and_read_only_working_days():
+    plan = sample_plan()
+    plan.holidays = ["2026-11-17 Day off"]
+    plan.working_days = ["2026-11-21 Catch-up"]
+    snapshot = make_snapshot(plan)
+    assert snapshot.payload["project"]["holidays"] == ["2026-11-17 Day off"]
+    assert snapshot.payload["project"]["working_days"] == ["2026-11-21 Catch-up"]
+    assert "working_days" in snapshot.payload["calendar"]
+    result = apply_operations(snapshot, proposal(snapshot, operation(
+        "update_project", holidays=["2026-12-21..2027-01-01 Christmas", "2026-11-17 Day off"])))
+    assert result.holidays == ["2026-12-21..2027-01-01 Christmas", "2026-11-17 Day off"]
+    assert result.working_days == ["2026-11-21 Catch-up"]               # the AI cannot change working days
+    changes = compare_plans(plan, result).changes
+    assert [(c.item, c.field) for c in changes if c.category == "Direct"] == [("Project", "Holidays")]
+    result.working_days = []
+    assert [c.field for c in compare_plans(plan, result).changes if c.item == "Project"] == ["Holidays", "Working days"]
+
+
+@pytest.mark.parametrize("holidays, message", [
+    (["2026-12-25", "2026-12-25"], "overlaps"),
+    (["2026-12-21..2027-01-01", "2026-12-25 Christmas Day"], "overlaps"),
+    (["not-a-date"], "Invalid holiday list"),
+    (["2027-01-01..2026-12-21"], "ends before it starts"),
+    (["2026-12-25 " + "x" * 130], "Invalid holiday list"),
+])
+def test_ai_holiday_edits_are_validated_like_the_settings_dialog(holidays, message):
+    snapshot = make_snapshot(sample_plan())
+    with pytest.raises(ProposalError, match=message):
+        apply_operations(snapshot, proposal(snapshot, operation("update_project", holidays=holidays)))
+
+
+def test_an_ai_holiday_that_covers_a_working_day_is_rejected_as_an_invalid_project():
+    plan = sample_plan()
+    plan.working_days = ["2026-11-21"]
+    snapshot = make_snapshot(plan)
+    with pytest.raises(ProposalError, match="2026-11-21 cannot be both a holiday and a working day"):
+        apply_operations(snapshot, proposal(snapshot, operation("update_project", holidays=["2026-11-20..2026-11-22"])))

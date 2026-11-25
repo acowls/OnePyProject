@@ -617,3 +617,262 @@ def test_import_keeps_links_to_different_predecessors(tmp_path, monkeypatch):
     plan, notes = import_mpp(tmp_path / "ignored.mpp")
     assert plan.tasks[2].predecessors == [1, 2]
     assert not [note for note in notes if "duplicate" in note]
+
+
+# ---- project calendar: holidays and working days ----------------------------------------------
+
+# Real 92-byte exception records from a Project-written file: a four-day holiday named "Easter"
+# (without its name bytes), and a Saturday worked 08:00-12:00 and 13:00-17:00 (2026-10-31, no name).
+REAL_HOLIDAY_RECORD = bytes.fromhex(
+    "4a3c4d3c04000000" + "00" * 64 + "01000000ffffffff01000000ffffffff0e000000")
+REAL_WORKING_RECORD = bytes.fromhex(
+    "1d3d1d3d010000000000000000000200c0120000c012781e0000000000000000600900006009000000000000"
+    "000000000000000060090000c01200000000000000000000000000000100000000000000040000000000000000000000")
+
+
+def _exception(first, last, name="", shifts=(), recurrence=0, occurrences=1, days=None):
+    """An exception record in the layout of the real ones above; ``first`` and ``last`` are dates."""
+    import struct
+    from datetime import date
+    epoch = date(1983, 12, 31)
+    record = bytearray(92)
+    first_day, last_day = (first - epoch).days, (last - epoch).days
+    struct.pack_into("<HHH", record, 0, first_day, last_day, last_day - first_day + 1 if days is None else days)
+    struct.pack_into("<H", record, 6, recurrence)
+    struct.pack_into("<H", record, 14, len(shifts))
+    for i, (start, finish) in enumerate(shifts):          # tenths of a minute
+        struct.pack_into("<H", record, 20 + 2 * i, start)
+        struct.pack_into("<I", record, 32 + 4 * i, finish - start)
+    struct.pack_into("<I", record, 72, occurrences)
+    encoded = (name + "\0").encode("utf-16-le") if name else b""
+    struct.pack_into("<I", record, 88, len(encoded))
+    return bytes(record) + encoded + b"\0" * ((-len(encoded)) % 4)
+
+
+def _calendar_blob(exceptions=(), week=None):
+    import struct
+    blob = bytearray(week if week is not None else b"\x01\x00" + b"\0" * 58 + (b"\x01\x00" + b"\0" * 58) * 6)
+    if exceptions:
+        blob += struct.pack("<I", len(exceptions)) + b"".join(exceptions) + b"\0\0\0\0"
+    return bytes(blob)
+
+
+def _read_calendar(blob):
+    from onepyproject import mpp
+    result = mpp.ProjectCalendar(name="Standard")
+    mpp._read_exceptions(blob, result)
+    return result
+
+
+def test_real_exception_records_are_read():
+    from datetime import date
+    from onepyproject.workcalendar import Period
+
+    result = _read_calendar(_calendar_blob([REAL_HOLIDAY_RECORD + "Easter\0".encode("utf-16-le") + b"\0\0",
+                                            REAL_WORKING_RECORD]))
+    assert result.holidays == [Period(date(2026, 4, 3), date(2026, 4, 6), "Easter")]
+    assert result.working_days == [Period(date(2026, 10, 31), date(2026, 10, 31), "")]
+    assert not result.notes
+
+
+def test_pymppwriter_exceptions_are_read_back_as_named_holiday_periods():
+    from datetime import date
+    from pymppwriter import blocks
+    from onepyproject.workcalendar import Period
+
+    days = [(blocks.CAL_DAY_DEFAULT, ())] * 7
+    blob = blocks.build_calendar_data(days, [(date(2026, 12, 21), date(2027, 1, 1), "Christmas shutdown"),
+                                             (date(2026, 12, 25 + 3), date(2026, 12, 28), "")])
+    result = _read_calendar(blob)
+    assert result.holidays == [Period(date(2026, 12, 21), date(2027, 1, 1), "Christmas shutdown")]  # merged
+    assert not result.notes
+
+
+def test_overlapping_exceptions_merge_and_a_name_is_made_storable():
+    from datetime import date
+
+    result = _read_calendar(_calendar_blob([
+        _exception(date(2026, 12, 21), date(2026, 12, 25), "Christmas, part 1"),
+        _exception(date(2026, 12, 24), date(2026, 12, 31), "Part 2"),
+        _exception(date(2027, 1, 4), date(2027, 1, 4), "..Odd"),
+    ]))
+    assert [(p.start, p.finish, p.name) for p in result.holidays] == [
+        (date(2026, 12, 21), date(2026, 12, 31), "Christmas part 1"), (date(2027, 1, 4), date(2027, 1, 4), "Odd")]
+
+
+def test_exceptions_with_other_hours_or_a_recurrence_are_reported_not_imported():
+    from datetime import date
+
+    result = _read_calendar(_calendar_blob([
+        _exception(date(2026, 12, 24), date(2026, 12, 24), "Half day", shifts=[(4800, 7200)]),
+        _exception(date(2026, 12, 25), date(2026, 12, 25), "Yearly", recurrence=3),
+        _exception(date(2026, 12, 26), date(2026, 12, 26), "Twice", occurrences=2),
+        _exception(date(2026, 12, 27), date(2026, 12, 30), "Bad count", days=9),
+        _exception(date(2026, 12, 31), date(2026, 12, 31), "Real holiday"),
+    ]))
+    assert [p.name for p in result.holidays] == ["Real holiday"] and not result.working_days
+    assert result.notes == [
+        "1 exception with working hours other than 08:00-12:00 and 13:00-17:00 is not imported, so those days are "
+        "worked as normal days; the first is 2026-12-24 Half day",
+        "3 exceptions that cannot be represented (recurring, overlapping or very long) are not imported; "
+        "the first is 2026-12-25 Yearly",
+    ]
+
+
+def test_a_working_day_that_clashes_with_a_holiday_is_not_imported():
+    from datetime import date
+
+    standard = [(4800, 7200), (7800, 10200)]
+    result = _read_calendar(_calendar_blob([
+        _exception(date(2026, 10, 30), date(2026, 11, 2), "Bridge"),
+        _exception(date(2026, 10, 31), date(2026, 10, 31), "Catch-up", shifts=standard),
+    ]))
+    assert [p.name for p in result.holidays] == ["Bridge"] and not result.working_days
+    assert "1 exception that cannot be represented" in result.notes[0] and "2026-10-31" in result.notes[0]
+
+
+def test_a_truncated_exception_list_is_an_error_the_importer_turns_into_a_note():
+    from datetime import date
+
+    blob = _calendar_blob([_exception(date(2026, 12, 24), date(2026, 12, 24), "Cut")])[:-40]
+    with pytest.raises(ValueError, match="past the end"):
+        _read_calendar(blob)
+
+
+@pytest.mark.parametrize("pattern, standard", [(None, True), ("explicit", True), ("saturday", False), ("short", False)])
+def test_only_the_standard_week_is_recognised(pattern, standard):
+    import struct
+    from onepyproject import mpp
+
+    def block(day_type, shifts=()):
+        data = bytearray(60)
+        struct.pack_into("<HH", data, 0, day_type, len(shifts))
+        for i, (start, finish) in enumerate(shifts):
+            struct.pack_into("<H", data, 8 + 2 * i, start)
+            struct.pack_into("<I", data, 20 + 4 * i, finish - start)
+        return bytes(data)
+
+    full = [(4800, 7200), (7800, 10200)]
+    weekdays = [block(0, full)] * 5
+    week = {None: [block(1)] * 7,
+            "explicit": [block(0)] + weekdays + [block(0)],
+            "saturday": [block(0)] + weekdays + [block(0, full)],
+            "short": [block(0)] + weekdays[:4] + [block(0, [(4800, 7200)])] + [block(0)]}[pattern]
+    assert mpp._is_standard_week(b"".join(week)) is standard
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_files_have_no_calendar(monkeypatch):
+    """Importer tests that stub the readers name files that do not exist; give them an empty calendar."""
+    from onepyproject import mpp
+
+    real = mpp._mpp_calendar
+    monkeypatch.setattr(mpp, "_mpp_calendar",
+                        lambda path: real(path) if Path(path).exists() else mpp.ProjectCalendar(name="Standard"))
+
+
+def _calendar(holidays=(), working=(), notes=()):
+    from onepyproject import mpp
+    from onepyproject.workcalendar import parse_period
+
+    return mpp.ProjectCalendar(name="Standard", holidays=[parse_period(x) for x in holidays],
+                               working_days=[parse_period(x) for x in working], notes=list(notes))
+
+
+def test_import_sets_the_calendar_before_choosing_start_hints(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    # Task 2 follows task 1 and the file has it on the Friday, after the Thursday holiday.
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16", 3), _source_task(2, "2026-11-20")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_calendar", lambda path: _calendar(holidays=["2026-11-19 Day off"]))
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.holidays == ["2026-11-19 Day off"] and plan.working_days == []
+    assert notes == ["Imported 1 holiday period from the project calendar 'Standard'"]
+    # The links alone give the file's date on this calendar, so the task needs no hint.
+    assert (plan.tasks[1].start_mode, plan.tasks[1].earliest) == ("no_earlier", "")
+    assert schedule(plan)[2].start.date().isoformat() == "2026-11-20"
+
+    monkeypatch.setattr(mpp, "_mpp_calendar", lambda path: _calendar())
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].earliest == "2026-11-20"        # without the holiday the file's date is a floor
+    assert not notes
+
+
+def test_import_keeps_a_task_on_a_working_saturday_where_the_file_has_it(tmp_path, monkeypatch):
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-10-30"), _source_task(2, "2026-10-31")], [],
+              start=datetime(2026, 10, 26, 8))
+    monkeypatch.setattr(mpp, "_mpp_calendar", lambda path: _calendar(working=["2026-10-31"]))
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.working_days == ["2026-10-31"] and plan.holidays == []
+    assert notes == ["Imported 1 working day from the project calendar 'Standard'"]
+    assert schedule(plan)[2].start.date().isoformat() == "2026-10-31"
+
+    monkeypatch.setattr(mpp, "_mpp_calendar", lambda path: _calendar())
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert any("Recalculation moves 1 task" in note and "2026-10-31 became 2026-11-02" in note for note in notes)
+
+
+def test_import_counts_both_kinds_and_forwards_what_the_calendar_left_out(tmp_path, monkeypatch):
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16")], [])
+    monkeypatch.setattr(mpp, "_mpp_calendar", lambda path: _calendar(
+        holidays=["2026-12-21..2027-01-01 Christmas", "2026-04-03"], working=["2026-10-31", "2026-11-07"],
+        notes=["1 task uses a task calendar, which is not applied; they are scheduled on the project calendar"]))
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.holidays == ["2026-12-21..2027-01-01 Christmas", "2026-04-03"]
+    assert plan.working_days == ["2026-10-31", "2026-11-07"]
+    assert notes[:2] == ["Imported 2 holiday periods and 2 working days from the project calendar 'Standard'",
+                         "Project calendar: 1 task uses a task calendar, which is not applied; "
+                         "they are scheduled on the project calendar"]
+
+
+def test_an_unreadable_calendar_does_not_stop_the_import(tmp_path, monkeypatch):
+    from onepyproject import mpp
+
+    def broken(path):
+        raise ValueError("the calendar exceptions run past the end of the data")
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16")], [])
+    monkeypatch.setattr(mpp, "_mpp_calendar", broken)
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.holidays == [] and plan.working_days == [] and len(plan.tasks) == 1
+    assert notes == ["Project calendar: the project calendar could not be read (the calendar exceptions run past "
+                     "the end of the data), so no holidays or working days were imported"]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_holiday_periods_and_names_survive_an_mpp_round_trip(tmp_path):
+    plan = Plan(title="Calendar", start="2026-12-18",
+                holidays=["2026-12-21..2027-01-01 Christmas shutdown", "2026-12-25 Duplicate", "2027-04-02..2027-04-05 Easter",
+                          "2027-06-14"],
+                tasks=[Task(1, "Before", duration=1), Task(2, "After", duration=2, predecessors=[1])])
+    output = tmp_path / "calendar.mpp"
+    notes = export_mpp(plan, TEMPLATE, output)
+    assert not [note for note in notes if "Working days" in note]
+    imported, import_notes = import_mpp(output)
+    # The repeated 25 December joins the shutdown; every period keeps its name.
+    assert imported.holidays == ["2026-12-21..2027-01-01 Christmas shutdown", "2027-04-02..2027-04-05 Easter",
+                                 "2027-06-14"]
+    assert imported.working_days == []
+    assert "Imported 3 holiday periods from the project calendar 'Standard'" in import_notes
+    before, after = schedule(plan), schedule(imported)
+    assert [after[uid].start for uid in (1, 2)] == [before[uid].start for uid in (1, 2)]
+    assert after[2].start.date().isoformat() == "2027-01-04" and after[2].finish.date().isoformat() == "2027-01-05"
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_export_reports_weekend_working_days_it_cannot_write(tmp_path):
+    base = dict(title="Calendar", start="2026-10-26", tasks=[Task(1, "Work", duration=1)])
+    weekday = export_mpp(Plan(**base, working_days=["2026-10-28"]), TEMPLATE, tmp_path / "weekday.mpp")
+    assert not [note for note in weekday if "Working days" in note]       # a weekday is worked anyway
+    notes = export_mpp(Plan(**base, working_days=["2026-10-28", "2026-10-31..2026-11-01"]), TEMPLATE,
+                       tmp_path / "weekend.mpp")
+    assert ("Working days on a weekend are not written to the MPP, so Project schedules them as non-working: 2; "
+            "the first is 2026-10-31") in notes
+    imported, _ = import_mpp(tmp_path / "weekend.mpp")
+    assert imported.working_days == []

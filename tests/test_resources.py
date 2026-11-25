@@ -112,3 +112,13 @@ def test_indent_does_not_silently_turn_assigned_task_into_summary():
     with pytest.raises(ValueError, match="before making it a summary"):
         indent(plan, 2)
     assert plan.tasks[1].parent == 0
+
+
+def test_overallocation_on_a_working_saturday_is_reported():
+    resources = [Resource(1, "Ada", 100)]
+    tasks = [Task(1, "A", duration=1, earliest="2026-10-31", assignments=[ResourceAssignment(1, 100)]),
+             Task(2, "B", duration=1, earliest="2026-10-31", assignments=[ResourceAssignment(1, 100)])]
+    plan = Plan(start="2026-10-26", resources=resources, tasks=tasks, working_days=["2026-10-31"])
+    warning = overallocation_warnings(plan)[1][0]
+    assert warning.units == 200 and warning.start == datetime(2026, 10, 31, 8)
+    assert warning.finish == datetime(2026, 10, 31, 17)
