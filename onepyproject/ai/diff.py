@@ -63,7 +63,8 @@ def compare_plans(before: Plan, after: Plan) -> PlanDiff:
     def add(category, item, field, old, new):
         changes.append(Change(category, item, field, _value(old), _value(new)))
 
-    for field, label in (("title", "Project name"), ("start", "Project start"), ("holidays", "Holidays")):
+    for field, label in (("title", "Project name"), ("start", "Project start"), ("holidays", "Holidays"),
+                         ("working_days", "Working days")):
         old, new = getattr(before, field), getattr(after, field)
         if old != new:
             add("Direct", "Project", label, old, new)

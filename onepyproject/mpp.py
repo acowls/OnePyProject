@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from collections import Counter
 import copy
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 import math
 from pathlib import Path
 import os
@@ -23,13 +24,15 @@ from .model import (Plan, Resource, ResourceAssignment, Task, completion_percent
 from .dependencies import Dependency, format_dependency, lag_minutes, parse_dependency, task_numbers
 from .resources import migrate_legacy_resources
 from .mpp_template import strip_template_resources
+from .workcalendar import MAX_NAME_LENGTH, MAX_SPAN_DAYS, MAX_TOTAL_DAYS, Period, format_period, parse_period
 
 
 IMPORT_WARNING = (
     "MPP import is experimental and lossy. The reader can skip unscheduled tasks and "
-    "does not reliably read calendars, task types or all Project fields. This app "
+    "does not reliably read task types or all Project fields. The project calendar's holidays and "
+    "working days are imported, but the working week and hours are fixed. This app "
     "recalculates using its own limited scheduler. Costs, custom fields, "
-    "baselines, resource calendars, rates, timephased work, some lag units and other data may be lost. "
+    "baselines, resource and task calendars, rates, timephased work, some lag units and other data may be lost. "
     "Keep the original MPP and verify the imported schedule."
 )
 EXPORT_TASK_TYPES = {"duration": "fixed_duration", "work": "fixed_work", "units": "fixed_units"}
@@ -72,6 +75,178 @@ def _mpp_relation_records(path: str | Path) -> list[tuple[int, int, int, int, in
             lag = struct.unpack_from("<i", record, 16 if old_layout else 14)[0]
             result.append((pred, succ, kind, unit, lag))
     return result
+
+
+@dataclass
+class ProjectCalendar:
+    """The part of an MPP project calendar this app can model, and what it left out."""
+    name: str = ""
+    holidays: list[Period] = field(default_factory=list)
+    working_days: list[Period] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+# A calendar definition is seven 60-byte day blocks (Sunday first) then a count and the exception
+# records (see pymppwriter.blocks.build_calendar_data). An exception record is 92 bytes plus its
+# UTF-16 name padded to four bytes: first and last day (days after 1983-12-31) and the number of
+# days, then a day block at +12 holding the shifts that are worked on those days (none for a
+# holiday), then the recurrence fields. A plain, non-recurring range has +6 zero and one occurrence
+# at +72. Recurring exceptions have never been seen in a real file here, so any record that does
+# not have that shape is reported and not imported.
+CALENDAR_WEEK_SIZE = 7 * 60
+CALENDAR_EXCEPTION_SIZE = 92
+CALENDAR_DAY_BLOCK = 60
+STANDARD_SHIFTS = [(4800, 7200), (7800, 10200)]    # 08:00-12:00 and 13:00-17:00, in tenths of a minute
+STANDARD_HOURS = "08:00-12:00 and 13:00-17:00"
+
+
+def _shifts(data: bytes, base: int) -> list[tuple[int, int]] | None:
+    """The worked (start, finish) pairs of a day block at ``base``, in tenths of a minute."""
+    count = struct.unpack_from("<H", data, base + 2)[0]
+    if count > 5:
+        return None
+    result = []
+    for i in range(count):
+        start = struct.unpack_from("<H", data, base + 8 + 2 * i)[0]
+        result.append((start, start + struct.unpack_from("<I", data, base + 20 + 4 * i)[0]))
+    return result
+
+
+def _is_standard_week(blob: bytes) -> bool:
+    for index in range(7):
+        base = index * CALENDAR_DAY_BLOCK
+        if struct.unpack_from("<H", blob, base)[0] == 1:
+            continue                                  # the default for this weekday
+        weekday = (index + 6) % 7                     # block 0 is Sunday
+        if _shifts(blob, base) != (STANDARD_SHIFTS if weekday < 5 else []):
+            return False
+    return True
+
+
+def _merge_periods(periods: list[Period]) -> list[Period]:
+    """Join overlapping periods, so that the lists a person edits never overlap."""
+    merged: list[Period] = []
+    for period in sorted(periods, key=lambda item: (item.start, item.finish)):
+        if merged and period.start <= merged[-1].finish:
+            last = merged[-1]
+            if period.finish > last.finish:
+                merged[-1] = Period(last.start, period.finish, last.name)
+        else:
+            merged.append(period)
+    return merged
+
+
+def _calendar_name(text: str) -> str:
+    """A name this app can store: no commas, control characters or leading dots."""
+    text = re.sub(r"\s+", " ", re.sub(r"[,\x00-\x1f\x7f]+", " ", text)).strip().lstrip(".").strip()
+    return text[:MAX_NAME_LENGTH].strip()
+
+
+def _read_exceptions(blob: bytes, result: ProjectCalendar) -> None:
+    from pymppwriter import blocks
+    epoch = blocks.EPOCH.date()
+    position = CALENDAR_WEEK_SIZE
+    if len(blob) < position + 4:
+        return
+    count = struct.unpack_from("<I", blob, position)[0]
+    position += 4
+    holidays: list[Period] = []
+    working: list[Period] = []
+    other_hours: list[str] = []
+    not_representable: list[str] = []
+    for _ in range(count):
+        if position + CALENDAR_EXCEPTION_SIZE > len(blob):
+            raise ValueError("the calendar exceptions run past the end of the data")
+        first, last, days = struct.unpack_from("<HHH", blob, position)
+        recurrence = struct.unpack_from("<H", blob, position + 6)[0]
+        occurrences = struct.unpack_from("<I", blob, position + 72)[0]
+        name_length = struct.unpack_from("<I", blob, position + 88)[0]
+        end = position + CALENDAR_EXCEPTION_SIZE + name_length
+        if end > len(blob):
+            raise ValueError("a calendar exception name runs past the end of the data")
+        name = _calendar_name(blob[position + CALENDAR_EXCEPTION_SIZE:end].decode("utf-16-le", "replace"))
+        shifts = _shifts(blob, position + 12)
+        position = end + (-name_length) % 4
+        start, finish = epoch + timedelta(days=first), epoch + timedelta(days=last)
+        label = f"{start.isoformat()}" + (f"..{finish.isoformat()}" if finish != start else "")
+        label += f" {name}" if name else ""
+        if (last < first or days != last - first + 1 or last - first + 1 > MAX_SPAN_DAYS
+                or recurrence or occurrences != 1 or shifts is None):
+            not_representable.append(label)
+        elif not shifts:
+            holidays.append(Period(start, finish, name))
+        elif shifts == STANDARD_SHIFTS:
+            working.append(Period(start, finish, name))
+        else:
+            other_hours.append(label)
+    holidays, working = _merge_periods(holidays), _merge_periods(working)
+    holiday_days = {day for period in holidays for day in period.days()}
+    clashing = [period for period in working if any(day in holiday_days for day in period.days())]
+    if clashing:
+        not_representable += [format_period(period) for period in clashing]
+        working = [period for period in working if period not in clashing]
+    if sum(period.length for period in holidays) > MAX_TOTAL_DAYS or sum(period.length for period in working) > MAX_TOTAL_DAYS:
+        raise ValueError("the calendar lists too many days")
+    result.holidays, result.working_days = holidays, working
+    if other_hours:
+        result.notes.append(f"{_count(len(other_hours), 'exception')} with working hours other than {STANDARD_HOURS} "
+                            f"{'is' if len(other_hours) == 1 else 'are'} not imported, so those days are worked as normal "
+                            f"days; the first is {other_hours[0]}")
+    if not_representable:
+        result.notes.append(f"{_count(len(not_representable), 'exception')} that cannot be represented (recurring, "
+                            f"overlapping or very long) {'is' if len(not_representable) == 1 else 'are'} not "
+                            f"imported; the first is {not_representable[0]}")
+
+
+def _mpp_calendar(path: str | Path) -> ProjectCalendar:
+    """Read the project calendar's holidays and working days, and report what this app does not model.
+
+    The week is fixed in this app, so a different working week, task calendars and resource
+    calendars with their own working time are reported rather than applied.
+    """
+    from pymppwriter import blocks
+    from pymppwriter.reader import _Klass, _Reader
+    from pymppwriter.writer import CAL_DATA_VAR, CAL_NAME_VAR, NATIVE, TASK_META2_SIZE, TASK_META_SIZE
+    reader = _Reader(str(path))
+    base = "   114/TBkndCal"
+    try:
+        table = blocks.parse_var_meta(reader._get(base + "/VarMeta"))[1]
+        data = reader._get(base + "/Var2Data")
+    except KeyError:
+        return ProjectCalendar(notes=["the file has no calendar data, so no holidays or working days were imported"])
+    default = reader.props.get(blocks.PROPS_DEFAULT_CALENDAR_NAME)
+    wanted = blocks.decode_unicode(default) if default else "Standard"
+    names = {uid: blocks.decode_unicode(blocks.read_var(data, entries[CAL_NAME_VAR]))
+             for uid, entries in table.items() if CAL_NAME_VAR in entries}
+    uid = next((candidate for candidate, name in sorted(names.items()) if name == wanted), None)
+    if uid is None:
+        return ProjectCalendar(name=wanted, notes=[f"the project calendar {wanted!r} was not found, so no holidays or "
+                                                   "working days were imported"])
+    result = ProjectCalendar(name=wanted)
+    if CAL_DATA_VAR in table[uid]:
+        blob = blocks.read_var(data, table[uid][CAL_DATA_VAR])
+        if len(blob) >= CALENDAR_WEEK_SIZE:
+            if not _is_standard_week(blob):
+                result.notes.append(f"the working week is not Monday-Friday {STANDARD_HOURS}; this app uses that week")
+            _read_exceptions(blob, result)
+    # Calendars that other items use are not applied: say so when the file has any.
+    unnamed = [other for other, entries in table.items() if other != uid and CAL_DATA_VAR in entries
+               and CAL_NAME_VAR not in entries]
+    if unnamed:
+        result.notes.append(f"{_count(len(unnamed), 'resource calendar')} with its own working time "
+                            f"{'is' if len(unnamed) == 1 else 'are'} not applied; everyone uses the project calendar")
+    tasks = _Klass(reader, "   114/TBkndTask", TASK_META_SIZE, TASK_META2_SIZE, blocks.PROPS_TASK_FIELD_MAP,
+                   blocks.PROPS_TASK_RECORD_COUNT)
+    own = sum(1 for i in tasks.live_rows() if len(tasks.recs[i]) > 100
+              and (tasks.value(i, NATIVE["CALENDAR_UNIQUE_ID"], "<i") or -1) not in (-1, uid))
+    if own:
+        result.notes.append(f"{_count(own, 'task')} use a task calendar, which is not applied; "
+                            "they are scheduled on the project calendar")
+    return result
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" + ("" if number == 1 else "s")
 
 
 def _link_text(value) -> str:
@@ -252,8 +427,22 @@ def import_mpp(path: str | Path) -> tuple[Plan, list[str]]:
         notes.append(f"Project start moved from {project_start} to {first_task}, "
                      "the earliest task start in the file")
         project_start = first_task
+    # Holidays and working days must be known before any date is chosen, because the start
+    # hints below compare each stored date with what the links give on this calendar.
+    try:
+        calendar = _mpp_calendar(path)
+    except (KeyError, IndexError, ValueError, struct.error) as exc:
+        calendar = ProjectCalendar(notes=[f"the project calendar could not be read ({exc}), so no holidays or "
+                                          "working days were imported"])
+    imported = [_count(len(calendar.holidays), "holiday period"), _count(len(calendar.working_days), "working day")]
+    if calendar.holidays or calendar.working_days:
+        notes.append("Imported " + " and ".join(text for text, items in
+                                                 zip(imported, (calendar.holidays, calendar.working_days)) if items)
+                     + f" from the project calendar {calendar.name!r}")
+    notes.extend(f"Project calendar: {text}" for text in calendar.notes)
     plan = Plan(title=source.title or "Imported project", start=project_start.isoformat(),
-                tasks=tasks, resources=resources)
+                tasks=tasks, resources=resources, holidays=[format_period(p) for p in calendar.holidays],
+                working_days=[format_period(p) for p in calendar.working_days])
     stored = {task.uid: task.start.date() for task in source.tasks}
     # Choose each remaining task's start hint in one pass, in dependency order, so that a
     # task is compared with what its already-placed predecessors give. Where the links
@@ -367,15 +556,24 @@ def export_mpp(plan: Plan, template: str | Path, destination: str | Path,
             if abs(minutes * 10 - round(minutes * 10)) > 1e-6:
                 raise ValueError("MPP export supports lag precision of one tenth of a minute")
             relations.append(Relation(link.uid, task.uid, type=link.kind, lag_days=minutes / 480))
-    # Explicitly write the selected working calendar, including holiday exceptions.
+    # Explicitly write the selected working calendar, including named holiday periods. Overlapping
+    # entries (older plans may repeat a date) are joined so that Project gets one exception per day.
     from pymppwriter import Calendar, CalendarException
-    from datetime import date
-    calendar = Calendar(exceptions=[CalendarException(date.fromisoformat(day)) for day in plan.holidays])
+    holidays = _merge_periods([parse_period(entry) for entry in plan.holidays])
+    calendar = Calendar(exceptions=[CalendarException(period.start, period.finish, period.name)
+                                    for period in holidays])
     project = Project(title=plan.title, start=datetime.fromisoformat(plan.start + "T08:00"),
                       tasks=out_tasks, relations=relations, resources=resources,
                       assignments=assignments, calendar=calendar)
     notes = [f"Task {numbers[task.uid]}: custom collapsed-summary color is not preserved in MPP"
              for task in plan.tasks if task.summary_color]
+    # pymppwriter writes non-working exceptions only. A working day on a weekday changes nothing, but
+    # one on a weekend would be non-working in Project, so say so.
+    weekend_work = sorted(day for entry in plan.working_days for day in parse_period(entry).days()
+                          if day.weekday() >= 5)
+    if weekend_work:
+        notes.append(f"Working days on a weekend are not written to the MPP, so Project schedules them as "
+                     f"non-working: {len(weekend_work)}; the first is {weekend_work[0].isoformat()}")
     conflicts = start_conflicts(plan, scheduled)
     if conflicts:
         notes.append(f"Fixed tasks that start before their predecessors finish: {len(conflicts)}. The links are "

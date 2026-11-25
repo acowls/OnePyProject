@@ -1993,3 +1993,67 @@ def test_start_cell_keeps_a_fixed_start_and_clearing_it_releases_it(app, monkeyp
     assert window.calculated[2].start.date().isoformat() == "2026-11-19"
     assert not window.fixed_conflicts
     assert "Fixed start" not in window.items[2].toolTip(3)
+
+
+def test_settings_accept_holiday_periods_names_and_extra_working_days(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-10-26", holidays=["2026-12-25"], tasks=[Task(1, "Task")])
+    window.reset_history(saved=True)
+    window.refresh()
+
+    def edit(dialog):
+        assert dialog.working_days.toPlainText() == "" and dialog.working_days.accessibleName() == "Extra working days"
+        dialog.holidays.setPlainText("2026-12-21..2027-01-01   Christmas shutdown\n2027-04-02 Good Friday")
+        dialog.working_days.setPlainText("2026-10-31 Catch-up Saturday")
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", edit)
+    window.settings()
+    assert window.plan.holidays == ["2026-12-21..2027-01-01 Christmas shutdown", "2027-04-02 Good Friday"]
+    assert window.plan.working_days == ["2026-10-31 Catch-up Saturday"] and window.dirty
+    window.undo()
+    assert window.plan.holidays == ["2026-12-25"] and window.plan.working_days == []
+    window.close()
+
+
+@pytest.mark.parametrize("holidays, working, message", [
+    ("2026-12-21..2027-01-01\n2026-12-25", "", "overlaps"),
+    ("2026-12-25", "2026-12-25", "cannot be both a holiday and a working day"),
+    ("not-a-date", "", "Invalid date period"),
+    ("", "2026-10-31..2026-10-30", "ends before it starts"),
+])
+def test_settings_reject_bad_periods_and_keep_the_plan(app, tmp_path, monkeypatch, holidays, working, message):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+
+    def invalid(dialog):
+        dialog.holidays.setPlainText(holidays)
+        dialog.working_days.setPlainText(working)
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", invalid)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.settings()
+    assert errors and message in errors[0]
+    assert window.plan.holidays == [] and window.plan.working_days == [] and not window.dirty
+    assert window.density == "comfortable"
+    window.close()
+
+
+def test_settings_keep_untouched_entries_even_if_an_older_plan_repeats_a_date(app, tmp_path, monkeypatch):
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(preferences)
+    window.plan = Plan(start="2026-11-16", holidays=["2026-12-25", "2026-12-25"], tasks=[Task(1, "Task")])
+    window.reset_history(saved=True)
+    window.refresh()
+
+    def change_density_only(dialog):
+        dialog.density_selector.setCurrentIndex(dialog.density_selector.findData("dense"))
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(SettingsDialog, "exec", change_density_only)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.settings()
+    assert not errors and window.density == "dense" and window.plan.holidays == ["2026-12-25", "2026-12-25"]
+    window.close()

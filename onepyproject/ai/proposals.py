@@ -12,6 +12,7 @@ import re
 from ..dependencies import Dependency, format_dependency, parse_dependency, task_numbers
 from ..model import Plan, Resource, ResourceAssignment, Task, completion_percentages, descendants, schedule
 from ..resources import migrate_legacy_resources, overallocation_warnings
+from ..workcalendar import check_no_overlap, format_period, parse_period
 
 
 MAX_SNAPSHOT_BYTES = 300_000
@@ -119,8 +120,11 @@ def make_snapshot(plan: Plan) -> Snapshot:
                 for uid, values in overallocation_warnings(normalized).items()]
     payload = {
         "schema_version": SCHEMA_VERSION, "snapshot_revision": revision,
-        "project": {"name": baseline.title, "start_date": baseline.start, "holidays": list(baseline.holidays)},
-        "calendar": {"workdays": "Monday-Friday", "hours": "08:00-12:00, 13:00-17:00", "working_hours_per_day": 8},
+        "project": {"name": baseline.title, "start_date": baseline.start, "holidays": list(baseline.holidays),
+                    "working_days": list(baseline.working_days)},
+        "calendar": {"workdays": "Monday-Friday", "hours": "08:00-12:00, 13:00-17:00", "working_hours_per_day": 8,
+                     "holidays": "periods that are not worked: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD, optional name",
+                     "working_days": "dates worked with the standard hours even on a weekend; read-only"},
         "tasks": rows,
         "resources": [{"ref": f"resource:{r.uid}", "name": r.name, "capacity_percent": r.max_units}
                       for r in baseline.resources],
@@ -178,7 +182,7 @@ def parse_proposal(text: str, revision: str) -> dict:
             spec = FIELDS[field]
             if field == "holidays":
                 if (not isinstance(value, list) or len(value) > 1000
-                        or any(not isinstance(v, str) or len(v) > 32 or not _valid_unicode(v) for v in value)):
+                        or any(not isinstance(v, str) or len(v) > 160 or not _valid_unicode(v) for v in value)):
                     raise ProposalError("Invalid holiday list.")
             elif "string" in spec.get("type", []):
                 if not isinstance(value, str) or len(value) > 2000 or not _valid_unicode(value):
@@ -303,10 +307,13 @@ def apply_operations(snapshot: Snapshot, proposal: dict, *, reserved_task_ids=()
             if operation["start_date"] is not None:
                 candidate.start = _date(operation["start_date"])
             if operation["holidays"] is not None:
-                holidays = [_date(day) for day in operation["holidays"]]
-                if len(set(holidays)) != len(holidays):
-                    raise ProposalError("Holiday dates must be unique.")
-                candidate.holidays = holidays
+                # Each entry is a date or a range with an optional name, as in the project settings.
+                try:
+                    periods = [parse_period(entry) for entry in operation["holidays"]]
+                    check_no_overlap(periods, "Holiday")
+                except ValueError as exc:
+                    raise ProposalError(f"Invalid holiday list: {exc}") from exc
+                candidate.holidays = [format_period(period) for period in periods]
         elif kind == "create_task":
             temp = _temp(operation["temp_id"], "new-task")
             if temp in new_tasks:

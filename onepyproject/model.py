@@ -13,6 +13,7 @@ import re
 import tempfile
 
 from .dependencies import lag_minutes, parse_dependency, task_numbers
+from .workcalendar import WorkCalendar, uses_period_syntax, work_calendar
 
 
 # "duration": duration is the input and work is derived. "work": work is the input and
@@ -69,9 +70,12 @@ class Task:
 class Plan:
     title: str = "Untitled project"
     start: str = field(default_factory=lambda: date.today().isoformat())
+    # Holiday periods are not worked; working days are worked with the standard hours even on a
+    # weekend. Entries are dates or ranges with an optional name, e.g. "2026-12-21..2027-01-01 Christmas".
     holidays: list[str] = field(default_factory=list)
     tasks: list[Task] = field(default_factory=list)
     resources: list[Resource] = field(default_factory=list)
+    working_days: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -106,8 +110,11 @@ def save_plan(plan: Plan, path: str | Path) -> None:
     migrate_legacy_resources(snapshot)
     schedule(snapshot)
     target = Path(path)
-    # Keep the established file identifier so existing .pxplan files remain compatible.
-    payload = json.dumps({"format": "projectx-plan", "version": 3,
+    # Keep the established file identifier so existing .pxplan files remain compatible. Version 4
+    # is written only when the plan needs it (working days, or holiday ranges and names), so that
+    # an older build refuses such a file instead of misreading its calendar.
+    version = 4 if snapshot.working_days or uses_period_syntax(snapshot.holidays) else 3
+    payload = json.dumps({"format": "projectx-plan", "version": version,
                           "plan": asdict(snapshot)}, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=".onepyproject-", suffix=".pxplan", dir=target.parent)
     try:
@@ -121,7 +128,7 @@ def save_plan(plan: Plan, path: str | Path) -> None:
 
 def load_plan(path: str | Path) -> Plan:
     obj = json.loads(Path(path).read_text(encoding="utf-8"))
-    if obj.get("format") != "projectx-plan" or obj.get("version") not in (1, 2, 3):
+    if obj.get("format") != "projectx-plan" or obj.get("version") not in (1, 2, 3, 4):
         raise ValueError("Not a supported OnePyProject plan")
     data = obj["plan"]
     tasks = []
@@ -130,22 +137,23 @@ def load_plan(path: str | Path) -> Plan:
         values["assignments"] = [ResourceAssignment(**assignment) for assignment in values.get("assignments", [])]
         tasks.append(Task(**values))
     plan = Plan(title=data["title"], start=data["start"], holidays=data.get("holidays", []),
-                tasks=tasks, resources=[Resource(**item) for item in data.get("resources", [])])
+                tasks=tasks, resources=[Resource(**item) for item in data.get("resources", [])],
+                working_days=data.get("working_days", []))
     from .resources import migrate_legacy_resources
     migrate_legacy_resources(plan)
     schedule(plan)
     return plan
 
 
-def _is_workday(day: date, holidays: set[date]) -> bool:
-    return day.weekday() < 5 and day not in holidays
+def _is_workday(day: date, calendar: WorkCalendar) -> bool:
+    return calendar.is_workday(day)
 
 
-def next_start(point: datetime, holidays: set[date]) -> datetime:
+def next_start(point: datetime, calendar: WorkCalendar) -> datetime:
     """First working instant at or after point, excluding period end boundaries."""
     day = point.date()
     while True:
-        if _is_workday(day, holidays):
+        if _is_workday(day, calendar):
             for lo, hi in ((time(8), time(12)), (time(13), time(17))):
                 start, end = datetime.combine(day, lo), datetime.combine(day, hi)
                 candidate = max(point, start)
@@ -154,10 +162,10 @@ def next_start(point: datetime, holidays: set[date]) -> datetime:
         day += timedelta(days=1)
 
 
-def add_work(start: datetime, minutes: float, holidays: set[date]) -> datetime:
+def add_work(start: datetime, minutes: float, calendar: WorkCalendar) -> datetime:
     if minutes <= 0:
         return start
-    point = next_start(start, holidays)
+    point = next_start(start, calendar)
     remaining = round(minutes, 6)
     while remaining > 0.000001:
         end_time = time(12) if point.time() < time(12) else time(17)
@@ -166,17 +174,17 @@ def add_work(start: datetime, minutes: float, holidays: set[date]) -> datetime:
         if remaining <= available:
             return point + timedelta(minutes=remaining)
         remaining -= available
-        point = next_start(end, holidays)
+        point = next_start(end, calendar)
     return point
 
 
-def subtract_work(end: datetime, minutes: float, holidays: set[date]) -> datetime:
+def subtract_work(end: datetime, minutes: float, calendar: WorkCalendar) -> datetime:
     """Move backwards through the working calendar, preserving boundary times."""
     if minutes <= 0:
         return end
     remaining, day = round(minutes, 6), end.date()
     while remaining > 0.000001:
-        if _is_workday(day, holidays):
+        if _is_workday(day, calendar):
             for lo, hi in ((time(13), time(17)), (time(8), time(12))):
                 start = datetime.combine(day, lo)
                 stop = min(end, datetime.combine(day, hi))
@@ -188,29 +196,29 @@ def subtract_work(end: datetime, minutes: float, holidays: set[date]) -> datetim
     return end
 
 
-def milestone_at_or_after(point: datetime, holidays: set[date]) -> datetime:
-    if _is_workday(point.date(), holidays) and (
+def milestone_at_or_after(point: datetime, calendar: WorkCalendar) -> datetime:
+    if _is_workday(point.date(), calendar) and (
         time(8) <= point.time() <= time(12) or time(13) <= point.time() <= time(17)
     ):
         return point
-    return next_start(point, holidays)
+    return next_start(point, calendar)
 
 
-def offset_time(anchor: datetime, minutes: float, elapsed: bool, holidays: set[date]) -> datetime:
+def offset_time(anchor: datetime, minutes: float, elapsed: bool, calendar: WorkCalendar) -> datetime:
     if elapsed:
         return anchor + timedelta(minutes=minutes)
     if minutes > 0:
-        return add_work(anchor, minutes, holidays)
+        return add_work(anchor, minutes, calendar)
     if minutes < 0:
-        return subtract_work(anchor, -minutes, holidays)
+        return subtract_work(anchor, -minutes, calendar)
     return anchor
 
 
-def work_between(start: datetime, finish: datetime, holidays: set[date]) -> float:
+def work_between(start: datetime, finish: datetime, calendar: WorkCalendar) -> float:
     result = 0.0
     day = start.date()
     while day <= finish.date():
-        if _is_workday(day, holidays):
+        if _is_workday(day, calendar):
             for lo, hi in ((time(8), time(12)), (time(13), time(17))):
                 begin = max(start, datetime.combine(day, lo))
                 end = min(finish, datetime.combine(day, hi))
@@ -220,7 +228,7 @@ def work_between(start: datetime, finish: datetime, holidays: set[date]) -> floa
 
 
 def _place_leaf(floor: datetime, start_bound: datetime | None, finish_bound: datetime | None,
-                duration: float, holidays: set[date], number: int) -> tuple[datetime, datetime]:
+                duration: float, calendar: WorkCalendar, number: int) -> tuple[datetime, datetime]:
     """Start and finish of a leaf: the latest of its floor and link bounds, on working time."""
     start = floor
     if start_bound is not None:
@@ -228,23 +236,23 @@ def _place_leaf(floor: datetime, start_bound: datetime | None, finish_bound: dat
     if not duration and finish_bound is not None:
         start = max(start, finish_bound)
     if duration > 0:
-        start = next_start(start, holidays)
+        start = next_start(start, calendar)
     else:
-        start = milestone_at_or_after(start, holidays)
-    finish = add_work(start, duration * 480, holidays)
+        start = milestone_at_or_after(start, calendar)
+    finish = add_work(start, duration * 480, calendar)
     if duration > 0 and finish_bound is not None and finish < finish_bound:
         # For FF/SF, find the earliest start whose working-time finish
         # meets the finish constraint. Off-hours cannot be a work finish.
-        candidate = subtract_work(finish_bound, duration * 480, holidays)
-        start = next_start(max(start, candidate), holidays)
-        finish = add_work(start, duration * 480, holidays)
+        candidate = subtract_work(finish_bound, duration * 480, calendar)
+        start = next_start(max(start, candidate), calendar)
+        finish = add_work(start, duration * 480, calendar)
         if finish < finish_bound:
             # A finish constraint in a non-working gap, or exactly at
             # a work-period start, needs the next representable tick.
-            target = next_start(finish_bound, holidays) + timedelta(seconds=6)
-            candidate = subtract_work(target, duration * 480, holidays)
-            start = next_start(max(start, candidate), holidays)
-            finish = add_work(start, duration * 480, holidays)
+            target = next_start(finish_bound, calendar) + timedelta(seconds=6)
+            candidate = subtract_work(target, duration * 480, calendar)
+            start = next_start(max(start, candidate), calendar)
+            finish = add_work(start, duration * 480, calendar)
         if finish < finish_bound:
             raise ValueError(f"Task {number}: cannot satisfy finish dependency")
     return start, finish
@@ -265,7 +273,7 @@ def _leaf_links(task: Task, tasks: dict[int, Task], numbers: dict[int, int]) -> 
 
 
 def _link_bounds(links: list, get: Callable[[int], Scheduled], tasks: dict[int, Task],
-                 holidays: set[date]) -> tuple[datetime | None, datetime | None]:
+                 calendar: WorkCalendar) -> tuple[datetime | None, datetime | None]:
     """The latest start and finish that a leaf's links impose; ``get`` places a predecessor."""
     start_bound = finish_bound = None
     for owner, link in links:
@@ -274,7 +282,7 @@ def _link_bounds(links: list, get: Callable[[int], Scheduled], tasks: dict[int, 
         predecessor = get(link.uid)
         minutes, elapsed = lag_minutes(link, predecessor.duration)
         anchor = predecessor.finish if link.kind in ("FS", "FF") else predecessor.start
-        bound = offset_time(anchor, minutes, elapsed, holidays)
+        bound = offset_time(anchor, minutes, elapsed, calendar)
         if link.kind in ("FS", "SS"):
             start_bound = bound if start_bound is None else max(start_bound, bound)
         else:
@@ -300,7 +308,7 @@ def schedule(plan: Plan, *, on_leaf: Callable[[Task, datetime], None] | None = N
     MPP importer uses this to choose a hint for each task in a single pass.
     """
     project_start = datetime.combine(date.fromisoformat(plan.start), time(8))
-    holidays = {date.fromisoformat(value) for value in plan.holidays}
+    calendar = work_calendar(plan)
     tasks = {t.uid: t for t in plan.tasks}
     if len(tasks) != len(plan.tasks) or any(uid <= 0 for uid in tasks):
         raise ValueError("Task IDs must be unique positive numbers")
@@ -391,7 +399,7 @@ def schedule(plan: Plan, *, on_leaf: Callable[[Task, datetime], None] | None = N
                                      f"not {link.kind}")
             kids = [calculate(child) for child in children[uid]]
             start, finish = min(c.start for c in kids), max(c.finish for c in kids)
-            item = Scheduled(start, finish, work_between(start, finish, holidays) / 480,
+            item = Scheduled(start, finish, work_between(start, finish, calendar) / 480,
                              sum(c.work for c in kids), True)
         else:
             units = total_units(task)
@@ -406,10 +414,10 @@ def schedule(plan: Plan, *, on_leaf: Callable[[Task, datetime], None] | None = N
                 raise ValueError(f"Task {number}: calculated duration or work is too large")
             # Every link is resolved even for a fixed task, so missing predecessors and
             # cycles are still reported; a fixed task just ignores the resulting bounds.
-            start_bound, finish_bound = _link_bounds(_leaf_links(task, tasks, numbers), calculate, tasks, holidays)
+            start_bound, finish_bound = _link_bounds(_leaf_links(task, tasks, numbers), calculate, tasks, calendar)
             if on_leaf is not None:
                 try:
-                    free, _ = _place_leaf(project_start, start_bound, finish_bound, duration, holidays, number)
+                    free, _ = _place_leaf(project_start, start_bound, finish_bound, duration, calendar, number)
                 except ValueError:
                     if task.start_mode != "fixed":
                         raise
@@ -420,9 +428,9 @@ def schedule(plan: Plan, *, on_leaf: Callable[[Task, datetime], None] | None = N
             if task.earliest:
                 floor = max(project_start, datetime.combine(date.fromisoformat(task.earliest), time(8)))
             if task.start_mode == "fixed":
-                start, finish = _place_leaf(floor, None, None, duration, holidays, number)
+                start, finish = _place_leaf(floor, None, None, duration, calendar, number)
             else:
-                start, finish = _place_leaf(floor, start_bound, finish_bound, duration, holidays, number)
+                start, finish = _place_leaf(floor, start_bound, finish_bound, duration, calendar, number)
             item = Scheduled(start, finish, duration, work)
         result[uid] = item
         visiting.remove(uid)
@@ -445,16 +453,16 @@ def start_conflicts(plan: Plan, calculated: dict[int, Scheduled] | None = None) 
     numbers = task_numbers(plan.tasks)
     summaries = {task.parent for task in plan.tasks if task.parent}
     project_start = datetime.combine(date.fromisoformat(plan.start), time(8))
-    holidays = {date.fromisoformat(value) for value in plan.holidays}
+    calendar = work_calendar(plan)
     found: dict[int, datetime] = {}
     for task in plan.tasks:
         if task.start_mode != "fixed" or task.uid in summaries:
             continue
         start_bound, finish_bound = _link_bounds(_leaf_links(task, tasks, numbers), calculated.__getitem__,
-                                                 tasks, holidays)
+                                                 tasks, calendar)
         try:
             free, _ = _place_leaf(project_start, start_bound, finish_bound, calculated[task.uid].duration,
-                                  holidays, numbers[task.uid])
+                                  calendar, numbers[task.uid])
         except ValueError:
             continue  # A fixed task need not satisfy its finish links.
         if free.date() > calculated[task.uid].start.date():

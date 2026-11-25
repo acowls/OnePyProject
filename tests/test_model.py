@@ -377,3 +377,83 @@ def test_start_mode_round_trips_and_older_plans_load_as_no_earlier(tmp_path):
         del task["start_mode"]
     path.write_text(json.dumps(stored), encoding="utf-8")
     assert {task.start_mode for task in load_plan(path).tasks} == {"no_earlier"}
+
+
+def test_a_holiday_range_covers_a_weekend_and_names_do_not_matter():
+    tasks = [Task(1, "Work", duration=2)]
+    ranged = Plan(start="2026-12-18", holidays=["2026-12-21..2027-01-01 Christmas shutdown"], tasks=tasks)
+    singles = Plan(start="2026-12-18", holidays=[f"2026-12-{day}" for day in range(21, 32)] + ["2027-01-01"], tasks=tasks)
+    item = schedule(ranged)[1]
+    # One day on the Friday, the shutdown (12 days across two weekends), then the Monday.
+    assert item.start == datetime(2026, 12, 18, 8) and item.finish == datetime(2027, 1, 4, 17)
+    assert schedule(singles)[1] == item
+
+
+def test_a_working_saturday_is_worked_with_the_standard_hours():
+    plan = Plan(start="2026-10-30", working_days=["2026-10-31 Catch-up Saturday"], tasks=[
+        Task(1, "Phase"),
+        Task(2, "Two days", parent=1, duration=2),
+        Task(3, "Next", duration=1, predecessors=[2]),
+        Task(4, "Half day", duration=0.5, predecessors=[2]),
+    ])
+    items = schedule(plan)
+    assert items[2].start == datetime(2026, 10, 30, 8) and items[2].finish == datetime(2026, 10, 31, 17)
+    assert items[1].duration == 2 and items[1].finish == datetime(2026, 10, 31, 17)
+    # The Sunday is still off, so the work after it starts on the Monday.
+    assert items[3].start == datetime(2026, 11, 2, 8) and items[4].start == datetime(2026, 11, 2, 8)
+
+
+def test_a_working_saturday_can_hold_a_floor_and_a_milestone():
+    plan = Plan(start="2026-10-26", working_days=["2026-10-31"], tasks=[
+        Task(1, "Floor on the Saturday", duration=1, earliest="2026-10-31"),
+        Task(2, "Gate", duration=0, earliest="2026-10-31"),
+    ])
+    items = schedule(plan)
+    assert items[1].start == datetime(2026, 10, 31, 8) and items[1].finish == datetime(2026, 10, 31, 17)
+    assert items[2].start == items[2].finish == datetime(2026, 10, 31, 8)
+    # Without the working day the same floor moves to the Monday.
+    plan.working_days = []
+    assert schedule(plan)[1].start == datetime(2026, 11, 2, 8)
+
+
+def test_a_holiday_on_a_working_day_is_rejected():
+    plan = Plan(start="2026-10-26", holidays=["2026-10-30..2026-11-02"], working_days=["2026-10-31"],
+                tasks=[Task(1, "Work")])
+    with pytest.raises(ValueError, match="2026-10-31 cannot be both a holiday and a working day"):
+        schedule(plan)
+
+
+def test_a_bad_holiday_entry_names_the_list_it_is_in():
+    with pytest.raises(ValueError, match="Holidays: Invalid date period 'soon'"):
+        schedule(Plan(holidays=["soon"], tasks=[Task(1, "Work")]))
+    with pytest.raises(ValueError, match="Working days: Invalid date period 'soon'"):
+        schedule(Plan(working_days=["soon"], tasks=[Task(1, "Work")]))
+
+
+def test_duplicate_and_overlapping_holidays_from_older_plans_still_schedule():
+    plan = Plan(start="2026-12-24", holidays=["2026-12-25", "2026-12-25", "2026-12-24..2026-12-26"],
+                tasks=[Task(1, "Work")])
+    assert schedule(plan)[1].start == datetime(2026, 12, 28, 8)
+
+
+def test_plain_holidays_save_as_version_3_and_periods_or_working_days_as_version_4(tmp_path):
+    plain = Plan(start="2026-11-16", holidays=["2026-12-25"], tasks=[Task(1, "Work")])
+    ranged = Plan(start="2026-11-16", holidays=["2026-12-21..2027-01-01 Christmas shutdown"], tasks=[Task(1, "Work")])
+    named = Plan(start="2026-11-16", holidays=["2026-12-25 Christmas Day"], tasks=[Task(1, "Work")])
+    working = Plan(start="2026-11-16", working_days=["2026-11-21"], tasks=[Task(1, "Work")])
+    for plan, version in ((plain, 3), (ranged, 4), (named, 4), (working, 4)):
+        path = tmp_path / f"v{version}-{len(plan.holidays)}-{len(plan.working_days)}.pxplan"
+        save_plan(plan, path)
+        assert json.loads(path.read_text())["version"] == version
+        assert load_plan(path) == plan
+
+
+def test_a_version_3_plan_opens_with_no_working_days_and_a_newer_one_is_refused(tmp_path):
+    path = tmp_path / "v3.pxplan"
+    path.write_text(json.dumps({"format": "projectx-plan", "version": 3,
+                                "plan": {"title": "Old", "start": "2026-11-16", "holidays": ["2026-12-25"],
+                                         "tasks": [{"uid": 1, "name": "Task"}]}}))
+    assert load_plan(path).working_days == [] and load_plan(path).holidays == ["2026-12-25"]
+    path.write_text(json.dumps({"format": "projectx-plan", "version": 5, "plan": {}}))
+    with pytest.raises(ValueError, match="Not a supported"):
+        load_plan(path)

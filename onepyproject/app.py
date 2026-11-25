@@ -28,6 +28,7 @@ from .dependencies import parse_dependency, parse_display_predecessors, remap_pr
 from .icons import toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
 from .resources import format_task_resources, migrate_legacy_resources, overallocation_warnings, set_task_resources
+from .workcalendar import format_period, parse_periods
 from .resource_ui import AssignResourcesDialog, ResourceSheetDialog
 from .resource_completion import ResourceCompleter
 from .report import export_html
@@ -624,13 +625,23 @@ class SettingsDialog(QDialog):
         self.start = QLineEdit(plan.start)
         self.holidays = QPlainTextEdit("\n".join(plan.holidays))
         self.holidays.setAccessibleName("Project holidays")
-        self.holidays.setPlaceholderText("One date per line: YYYY-MM-DD")
-        self.holidays.setMinimumHeight(120)
+        self.holidays.setPlaceholderText("One date or period per line, with an optional name:\n"
+                                         "2026-12-25 Christmas Day\n2026-12-21..2027-01-01 Christmas shutdown")
+        self.holidays.setMinimumHeight(110)
+        self.working_days = QPlainTextEdit("\n".join(plan.working_days))
+        self.working_days.setAccessibleName("Extra working days")
+        self.working_days.setPlaceholderText("Dates worked even though they fall on a weekend, e.g. 2026-10-31 Catch-up Saturday")
+        self.working_days.setMinimumHeight(70)
+        self.working_days.setMaximumHeight(100)
         form.addRow("Project name", self.title)
         form.addRow("Start date", self.start)
         form.addRow("Holidays", self.holidays)
+        form.addRow("Extra working days", self.working_days)
         project_layout.addLayout(form)
-        hint = QLabel("Working time: Monday–Friday, 08:00–12:00 and 13:00–17:00. Enter holidays one per line or separated by commas.")
+        hint = QLabel("Working time: Monday–Friday, 08:00–12:00 and 13:00–17:00. Holidays are not worked; extra working "
+                      "days are worked on the same hours even on a weekend. Enter one date (YYYY-MM-DD) or period "
+                      "(YYYY-MM-DD..YYYY-MM-DD) per line or separated by commas, optionally followed by a name "
+                      "(names cannot contain commas). Periods must not overlap.")
         hint.setWordWrap(True)
         project_layout.addWidget(hint)
         project_layout.addStretch()
@@ -1951,6 +1962,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Cannot export project", str(exc))
 
+    @staticmethod
+    def edited_periods(box, current: list[str]) -> list[str]:
+        """Entries typed in a settings box. A box left as it was keeps its entries exactly, so a plan
+        from an older version that repeats a date can still have its other settings saved."""
+        text = box.toPlainText()
+        if text == "\n".join(current):
+            return list(current)
+        return [format_period(period) for period in parse_periods(text)]
+
     def settings(self):
         dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,
                                 self.show_icon_labels, self.preferences.fileName(), self.confirm_task_deletion, self.density,
@@ -1959,8 +1979,8 @@ class MainWindow(QMainWindow):
             def update():
                 self.plan.title = dialog.title.text().strip() or "Untitled project"
                 self.plan.start = dialog.start.text().strip()
-                self.plan.holidays = [day.strip() for line in dialog.holidays.toPlainText().splitlines()
-                                      for day in line.split(",") if day.strip()]
+                self.plan.holidays = self.edited_periods(dialog.holidays, self.plan.holidays)
+                self.plan.working_days = self.edited_periods(dialog.working_days, self.plan.working_days)
             if self.mutate(update, self.selected_uid()):
                 self.digit_edits_duration = dialog.digit_edits_duration.isChecked()
                 self.confirm_task_deletion = dialog.confirm_task_deletion.isChecked()
