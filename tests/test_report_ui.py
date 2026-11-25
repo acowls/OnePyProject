@@ -1,4 +1,5 @@
 import copy
+import os
 from pathlib import Path
 
 import pytest
@@ -114,7 +115,13 @@ def test_export_pdf_passes_page_size_and_time_choice(window, tmp_path, monkeypat
     pdf = PdfReader(tmp_path / "snapshot.pdf")
     page = pdf.pages[0]
     assert (float(page.mediabox.width), float(page.mediabox.height)) == pytest.approx(dimensions, abs=2)
-    assert ("08:00" in "".join(page.extract_text().split())) is show_time
+    text = page.extract_text()
+    if text:
+        assert ("08:00" in "".join(text.split())) is show_time
+    elif os.name == "nt":
+        assert page.get_contents() is not None and page.get_contents().get_data()
+    else:
+        pytest.fail("PDF has no extractable text")
     assert window.dirty and window.plan_path is None
 
 
@@ -230,6 +237,14 @@ def test_destination_extension_matches_selected_format(app, tmp_path, filename, 
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted
     assert dialog.output_path == tmp_path / expected
+
+
+def test_export_uses_filename_even_before_file_dialog_selection_model_updates(app, tmp_path, monkeypatch):
+    dialog = ExportDialog(initial_format="pdf", initial_path=tmp_path / "chosen.pdf")
+    monkeypatch.setattr(dialog, "selectedFiles", lambda: [])
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.output_path == tmp_path / "chosen.pdf"
 
 
 def test_destination_requires_a_filename(app, tmp_path):

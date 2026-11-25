@@ -38,6 +38,13 @@ def test_snapshot_is_detached_and_uses_stable_refs_with_display_numbers():
     assert "path" not in json.dumps(snapshot.payload).lower()
 
 
+def test_snapshot_includes_progress_as_readonly_context():
+    snapshot = make_snapshot(Plan(start="2026-11-16", tasks=[Task(1, "Phase"),
+        Task(2, "Child", parent=1, duration=2, percent_complete=50)]))
+    assert snapshot.payload["tasks"][1]["percent_complete"] == 50
+    assert snapshot.payload["tasks"][0]["calculated"]["percent_complete"] == 50
+
+
 def test_create_tasks_resources_and_dependencies_on_copy():
     plan = sample_plan()
     baseline = copy.deepcopy(plan)
@@ -199,3 +206,15 @@ def test_proposal_parser_fails_closed_for_invalid_content():
                 json.dumps(proposal(snapshot, operation("update_task", target="task:10", duration_days=True)))):
         with pytest.raises(ProposalError):
             parse_proposal(raw, snapshot.revision)
+
+
+def test_clearing_the_earliest_date_of_a_fixed_task_releases_the_fixed_start():
+    plan = sample_plan()
+    plan.tasks[1].earliest, plan.tasks[1].start_mode = "2026-11-17", "fixed"
+    snapshot = make_snapshot(plan)
+    candidate = apply_operations(snapshot, proposal(snapshot, operation("update_task", target="task:40", earliest="")))
+    assert (candidate.tasks[1].earliest, candidate.tasks[1].start_mode) == ("", "no_earlier")
+    moved = apply_operations(snapshot, proposal(snapshot, operation("update_task", target="task:40",
+                                                                    earliest="2026-11-30")))
+    assert (moved.tasks[1].earliest, moved.tasks[1].start_mode) == ("2026-11-30", "fixed")
+    assert schedule(moved)[40].start.date().isoformat() == "2026-11-30"

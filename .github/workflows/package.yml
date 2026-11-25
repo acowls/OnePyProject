@@ -27,8 +27,8 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           architecture: ${{ matrix.architecture }}
@@ -45,7 +45,7 @@ jobs:
       - name: Package and test extracted application
         run: python packaging/package_artifact.py ${{ matrix.target }}
       - name: Upload private test artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OnePyProject-${{ steps.version.outputs.version }}-${{ matrix.target }}
           path: artifacts/*.zip

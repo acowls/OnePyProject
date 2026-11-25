@@ -52,6 +52,17 @@ def copy_distribution_license(name, destination):
     shutil.copyfile(distribution.locate_file(candidates[0]), destination)
 
 
+def distribution_source(name):
+    """Say where a distribution was installed from, without exposing a local path."""
+    text = metadata.distribution(name).read_text("direct_url.json")
+    if not text:
+        return "package index"
+    info = json.loads(text)
+    if info.get("vcs_info"):
+        return f"{info['url']}@{info['vcs_info'].get('commit_id', 'unknown')}"
+    return "local directory" if info["url"].startswith("file:") else info["url"]
+
+
 def smoke_test(executable):
     with tempfile.TemporaryDirectory(prefix="onepyproject-check-") as temporary:
         report = Path(temporary) / "smoke.txt"
@@ -101,6 +112,7 @@ def make_artifact(target, dist, output):
             "dependencies": {name: metadata.version(name) for name in
                              ("PySide6-Essentials", "shiboken6", "pymppwriter", "olefile", "PyInstaller", "openai",
                               "keyring", "google-auth", "requests")},
+            "pymppwriter_source": distribution_source("pymppwriter"),
             "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
             "warning": "Private test build; distribution compliance and signing are not validated.",
         }

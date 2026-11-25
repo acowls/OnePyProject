@@ -31,6 +31,11 @@ def run():
     app.setApplicationName("OnePyProject packaging smoke test")
     if pymppwriter.__version__ != "0.4.3":
         raise RuntimeError(f"Unexpected pymppwriter version: {pymppwriter.__version__}")
+    # The pinned fork reports the same version as the PyPI release, so check for what only the fork has:
+    # the reader that skips stale records, and the writer step that places a lead before its predecessor.
+    from pymppwriter import reader, writer
+    if not hasattr(reader._Klass, "live_rows") or not hasattr(writer, "retreat_working"):
+        raise RuntimeError("pymppwriter lacks the fixes OnePyProject needs; build against the pinned fork commit")
 
     # Bypass toolbar_icon's fallback so missing SVG plugins cannot pass silently.
     for filename in ICON_FILES.values():
@@ -40,6 +45,7 @@ def run():
         ):
             raise RuntimeError(f"SVG icon failed to render: {filename}")
     for filename in ("tree_open.svg", "tree_closed.svg", "ai_shield.svg", "ai_clear.svg", "ai_play.svg", "ai_stop.svg",
+                     "summary_color.svg",
                      "cut.svg", "copy.svg", "paste.svg"):
         image = QImage(str(ASSET_DIR.parent / "ui" / filename))
         if image.isNull():
@@ -50,7 +56,8 @@ def run():
     with TemporaryDirectory(prefix="onepyproject-smoke-") as directory:
         directory = Path(directory)
         plan = Plan(start="2026-11-16", resources=[Resource(1, "Example")],
-                    tasks=[Task(10, "Parent"), Task(20, "Child", parent=10, assignments=[ResourceAssignment(1)]),
+                    tasks=[Task(10, "Parent"), Task(20, "Child", parent=10, assignments=[ResourceAssignment(1)],
+                                                   percent_complete=50),
                            Task(30, "After", predecessors=[20])])
         path = directory / "smoke.pxplan"
         save_plan(plan, path)
@@ -128,6 +135,8 @@ def run():
         window.plan = plan
         window.show()
         window.refresh()
+        if window.tree.columnCount() != 10 or window.items[20].text(9) != "50.0%":
+            raise RuntimeError("Task completion column did not render")
         app.processEvents()
         window.tree.setCurrentItem(window.items[20], 1)
         context = window.task_context_menu()
@@ -153,9 +162,18 @@ def run():
         dialog = ExportDialog(window, initial_format="pdf", initial_path=directory / "chosen.pdf")
         if dialog.show_time.isChecked() or dialog.paper.currentData() != "A4":
             raise RuntimeError("Export dialog defaults are incorrect")
+        dialog.show()
+        app.processEvents()
         dialog.accept()
-        if dialog.output_path != directory / "chosen.pdf":
-            raise RuntimeError("Export dialog did not accept the selected file")
+        expected_export = directory / "chosen.pdf"
+        actual_export = dialog.output_path
+        if actual_export is None or actual_export.resolve() != expected_export.resolve():
+            raise RuntimeError(
+                "Export dialog did not accept the selected file: "
+                f"result={dialog.result()}, output={actual_export!r}, "
+                f"expected={expected_export!r}, directory={dialog.directory().absolutePath()!r}, "
+                f"filename={dialog.filename_edit.text()!r}"
+            )
         settings = SettingsDialog(plan, window)
         if settings.title.minimumWidth() < 400 or display_time(datetime(2026, 11, 11, 8), "short") != "11 Nov 08:00":
             raise RuntimeError("Settings or short date display is incorrect")

@@ -13,8 +13,8 @@ from .report import Report, ReportRow, format_report_time, make_report, timeline
 
 
 PAPER_SIZES = {"A4": QPageSize.PageSizeId.A4, "A3": QPageSize.PageSizeId.A3}
-COLUMN_LABELS = ("ID", "Task / parent", "Duration", "Start", "Finish", "Pred.", "Resources", "Work", "Mode", "Gantt")
-COLUMN_WIDTHS = (0.035, 0.185, 0.055, 0.10, 0.10, 0.07, 0.12, 0.05, 0.07, 0.215)
+COLUMN_LABELS = ("ID", "Task / parent", "Duration", "Start", "Finish", "Pred.", "Resources", "Work", "Mode", "Complete", "Gantt")
+COLUMN_WIDTHS = (0.035, 0.18, 0.055, 0.095, 0.095, 0.065, 0.11, 0.05, 0.07, 0.06, 0.185)
 
 
 def _text_layout(text: str, font: QFont, width: float, line_height: float) -> tuple[QTextLayout, int]:
@@ -38,7 +38,8 @@ def _text_layout(text: str, font: QFont, width: float, line_height: float) -> tu
 def _row_values(row: ReportRow, show_time: bool) -> tuple[str, ...]:
     name = row.name + (f" (parent {row.parent})" if row.parent else "")
     return (str(row.uid), name, row.duration, format_report_time(row.start, show_time),
-            format_report_time(row.finish, show_time), row.predecessors, row.resources, row.work, row.mode)
+            format_report_time(row.finish, show_time), row.predecessors, row.resources, row.work, row.mode,
+            row.percent_complete)
 
 
 def _draw_timeline(painter: QPainter, report: Report, row: ReportRow, rect: QRectF) -> None:

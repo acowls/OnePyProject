@@ -84,6 +84,55 @@ def test_estimated_duration_mpp_roundtrip(tmp_path):
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_percent_complete_mpp_roundtrip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase"),
+        Task(2, "Partial", parent=1, duration=2, percent_complete=35),
+        Task(3, "Complete", parent=1, duration=1, percent_complete=100)])
+    output = tmp_path / "progress.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [task.percent_complete for task in imported.tasks] == [57, 35, 100]
+    # Project holds a started task at its actual start, so the importer fixes both and says so
+    assert [task.start_mode for task in imported.tasks] == ["no_earlier", "fixed", "fixed"]
+    assert notes == ["Tasks fixed at their file dates because Project records them as 2 started: 2. "
+                     "Predecessors do not move them"]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_start_rules_survive_an_mpp_round_trip(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead", duration=2),
+        Task(2, "Pinned before its link", duration=1, predecessors=[1], earliest="2026-11-16", start_mode="fixed"),
+        Task(3, "Pinned after its link", duration=1, predecessors=[1], earliest="2026-11-23", start_mode="fixed"),
+        Task(4, "Floor", duration=1, predecessors=[1], earliest="2026-11-25"),
+        Task(5, "Link driven", duration=1, predecessors=[1])])
+    expected = schedule(plan)
+    output = tmp_path / "start-rules.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, _ = import_mpp(output)
+    by_name = {task.name: task for task in imported.tasks}
+    # A fixed task is written as Must Start On and comes back fixed; a floor comes back as a floor because
+    # its date is later than its links give; a task its links already place carries no rule.
+    assert [(name, task.start_mode, task.earliest) for name, task in by_name.items()] == [
+        ("Lead", "no_earlier", ""),
+        ("Pinned before its link", "fixed", "2026-11-16"),
+        ("Pinned after its link", "fixed", "2026-11-23"),
+        ("Floor", "no_earlier", "2026-11-25"),
+        ("Link driven", "no_earlier", "")]
+    dates = schedule(imported)
+    assert {task.name: dates[task.uid].start for task in imported.tasks} == {
+        task.name: expected[task.uid].start for task in plan.tasks}
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_custom_summary_color_is_reported_as_not_supported_in_mpp(tmp_path):
+    plan = Plan(start="2026-11-16", tasks=[Task(1, "Phase", summary_color="#f08040"),
+                                            Task(2, "Child", parent=1)])
+    notes = export_mpp(plan, TEMPLATE, tmp_path / "custom-color.mpp")
+    assert notes == ["Task 1: custom collapsed-summary color is not preserved in MPP"]
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
 def test_mpp_multiple_resources_and_unassigned_resource_roundtrip(tmp_path):
     plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada", 75), Resource(2, "Ben", 150), Resource(7, "Unassigned", 0)], tasks=[
         Task(1, "Team task", duration=3,
@@ -230,3 +279,341 @@ def test_mpp_import_does_not_guess_unknown_lag_units(tmp_path, monkeypatch):
     imported, notes = import_mpp(output)
     assert not imported.tasks[1].predecessors
     assert any("unsupported MPP" in note for note in notes)
+
+
+@pytest.mark.skipif(not TEMPLATE.exists(), reason="User-supplied MPP template not available")
+def test_fixed_units_and_summary_links_survive_an_export_and_import(tmp_path):
+    plan = Plan(title="Round trip", start="2026-11-16", resources=[Resource(1, "Ada", 100)], tasks=[
+        Task(1, "Lead in", duration=3, mode="units", assignments=[ResourceAssignment(1, 100)]),
+        Task(2, "Phase", predecessors=[1]),
+        Task(3, "First", parent=2, duration=2),
+        Task(4, "Second", parent=2, duration=1, mode="work", work=8, assignments=[ResourceAssignment(1, 100)],
+             predecessors=[3]),
+        Task(5, "Follow-on", duration=1, predecessors=["2FS+1d"]),
+    ])
+    output = tmp_path / "units-and-summary-links.mpp"
+    export_mpp(plan, TEMPLATE, output)
+    imported, notes = import_mpp(output)
+    assert [(t.uid, t.mode) for t in imported.tasks] == [(1, "units"), (2, "duration"), (3, "duration"),
+                                                         (4, "work"), (5, "duration")]
+    assert imported.tasks[1].predecessors == [1]                 # a link *to* a summary
+    assert [parse_dependency(p).uid for p in imported.tasks[4].predecessors] == [2]   # a link *from* a summary
+    assert not [note for note in notes if "omitted" in note or "fixed-units" in note]
+
+
+def test_export_hands_pymppwriter_summary_links_and_task_types(tmp_path, monkeypatch):
+    """No template needed: capture what export gives pymppwriter and run its own validation."""
+    from onepyproject import mpp
+    from pymppwriter.writer import effective_schedule, validate
+
+    captured = {}
+
+    class CapturingWriter:
+        def __init__(self, template):
+            pass
+
+        def write(self, project, destination):
+            validate(project)                  # structure, outline and cycle checks
+            effective_schedule(project)        # summary rows are rolled up, so summary links resolve
+            captured["project"] = project
+            Path(destination).write_bytes(b"")
+
+    monkeypatch.setattr(mpp, "MppWriter", CapturingWriter)
+    monkeypatch.setattr(mpp, "strip_template_resources", lambda writer: None)
+    template = tmp_path / "empty-template.mpp"
+    template.write_bytes(b"")
+    plan = Plan(start="2026-11-16", resources=[Resource(1, "Ada", 100)], tasks=[
+        Task(1, "Lead in", duration=3, mode="units", assignments=[ResourceAssignment(1, 100)]),
+        Task(2, "Phase", predecessors=["1"]),
+        Task(3, "First", parent=2, duration=2),
+        Task(4, "Second", parent=2, duration=1, mode="work", work=8, assignments=[ResourceAssignment(1, 100)],
+             predecessors=[3]),
+        Task(5, "Follow-on", duration=1, predecessors=["2FS+1d"]),
+    ])
+    export_mpp(plan, template, tmp_path / "out.mpp")
+    project = captured["project"]
+    assert [t.task_type for t in project.tasks] == ["fixed_units", "fixed_duration", "fixed_duration",
+                                                    "fixed_work", "fixed_duration"]
+    assert [(r.pred_uid, r.succ_uid, r.type, r.lag_days) for r in project.relations] == [
+        (1, 2, "FS", 0.0), (3, 4, "FS", 0.0), (2, 5, "FS", 1.0)]
+
+
+def test_import_keeps_summary_links_maps_fixed_units_and_reports_what_it_drops(tmp_path, monkeypatch):
+    """Importer mapping on stand-in source data, so no MPP file is needed."""
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    def task(uid, name, start, days, parent=0):
+        return NS(uid=uid, name=name, parent_uid=parent, start=datetime.fromisoformat(start),
+                  duration_days=days, estimated=False, percent_complete=0)
+
+    def link(pred, succ, kind):
+        return NS(pred_uid=pred, succ_uid=succ, type=kind)
+
+    source = NS(title="Stand-in", start=datetime(2026, 11, 16, 8), resources=[], assignments=[], tasks=[
+        task(1, "Lead in", "2026-11-16", 3), task(2, "Phase", "2026-11-17", 1),
+        task(3, "First", "2026-11-17", 1, parent=2), task(4, "Second", "2026-11-20", 1, parent=2),
+        task(5, "After", "2026-11-24", 1), task(6, "Side", "2026-11-16", 1),
+    ], relations=[link(1, 2, "FS"), link(2, 5, "FS"), link(6, 2, "FF"), link(99, 3, "FS")])
+    records = [(1, 2, 1, 7, 0), (2, 5, 1, 7, 0), (6, 2, 0, 7, 0), (99, 3, 1, 7, 0)]
+    types = {1: (0, 24.0), 3: (0, 8.0), 4: (0, 8.0), 5: (1, 8.0), 6: (0, 8.0)}
+    monkeypatch.setattr(mpp, "read_project", lambda path: source)
+    monkeypatch.setattr(mpp, "_mpp_resource_values", lambda path: ({}, []))
+    monkeypatch.setattr(mpp, "_mpp_task_work", lambda path: types)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: records)
+
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert [(t.uid, t.mode) for t in plan.tasks] == [(1, "units"), (2, "duration"), (3, "units"),
+                                                     (4, "units"), (5, "duration"), (6, "units")]
+    assert plan.tasks[1].predecessors == [1]          # link to a summary is kept
+    assert plan.tasks[4].predecessors == [2]          # link from a summary is kept
+    assert notes == [
+        "Task 2: omitted FF dependency on task 6; a summary task supports only FS and SS links",
+        "Task 3: omitted dependency on missing task UID 99",
+        "Tasks also fixed at their file dates because the file starts them before their predecessors "
+        "allow: 1; the first is Task 3 (2026-11-17)",
+        "Fixed tasks that start before their predecessors finish, as in the file: 1. "
+        "The links are kept; the first is Task 3",
+    ]
+    # The task the file starts before its summary's predecessor is held where the file has it.
+    assert (plan.tasks[2].start_mode, plan.tasks[2].earliest) == ("fixed", "2026-11-17")
+    assert schedule(plan)[3].start.date().isoformat() == "2026-11-17"
+
+
+def test_import_starts_the_plan_at_the_earliest_task_when_the_recorded_start_is_later(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    def task(uid, start, days=2):
+        return NS(uid=uid, name=f"Task {uid}", parent_uid=0, start=datetime.fromisoformat(start),
+                  duration_days=days, estimated=False, percent_complete=0)
+
+    source = NS(title="Late start", start=datetime(2026, 6, 2, 8), resources=[], assignments=[],
+                tasks=[task(1, "2025-11-03"), task(2, "2026-02-05")], relations=[])
+    monkeypatch.setattr(mpp, "read_project", lambda path: source)
+    monkeypatch.setattr(mpp, "_mpp_resource_values", lambda path: ({}, []))
+    monkeypatch.setattr(mpp, "_mpp_task_work", lambda path: {})
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [])
+
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.start == "2025-11-03"
+    assert notes == ["Project start moved from 2026-06-02 to 2025-11-03, the earliest task start in the file"]
+    items = schedule(plan)
+    assert items[1].start.date().isoformat() == "2025-11-03" and items[2].start.date().isoformat() == "2026-02-05"
+
+    source.start = datetime(2025, 10, 1, 8)               # an earlier recorded start is kept as it is
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.start == "2025-10-01" and not notes
+
+
+def _stand_in(monkeypatch, tasks, relations, start=datetime(2026, 11, 16, 8)):
+    """Patch the reader so importer decisions can be tested without an MPP file."""
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    source = NS(title="Stand-in", start=start, resources=[], assignments=[], tasks=tasks, relations=relations)
+    monkeypatch.setattr(mpp, "read_project", lambda path: source)
+    monkeypatch.setattr(mpp, "_mpp_resource_values", lambda path: ({}, []))
+    monkeypatch.setattr(mpp, "_mpp_task_work", lambda path: {})
+    monkeypatch.setattr(mpp, "_mpp_relation_records",
+                        lambda path: [(r.pred_uid, r.succ_uid, 1, 7, 0) for r in relations])
+    return source
+
+
+def _source_task(uid, start, days=1, percent=0, manual=False, constraint=None):
+    from types import SimpleNamespace as NS
+    return NS(uid=uid, name=f"Task {uid}", parent_uid=0, start=datetime.fromisoformat(start), duration_days=days,
+              estimated=False, percent_complete=percent, manual=manual, constraint=constraint)
+
+
+def test_import_gives_each_task_the_start_hint_the_file_needs(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject.model import start_conflicts
+
+    links = [NS(pred_uid=1, succ_uid=uid, type="FS") for uid in (2, 3, 4, 7)]
+    _stand_in(monkeypatch, [
+        _source_task(1, "2026-11-16", 3),                         # no links: starts on the project start
+        _source_task(2, "2026-11-19"),                            # the link gives exactly this date
+        _source_task(3, "2026-11-26"),                            # later than the link gives: a floor
+        _source_task(4, "2026-11-17", percent=40),                # started before its predecessor finished
+        _source_task(5, "2026-11-30", manual=True),               # manually scheduled
+        _source_task(6, "2026-12-01", constraint="MSO"),          # Must Start On
+        _source_task(7, "2026-11-17"),                            # the file breaks this link, no recorded cause
+        _source_task(8, "2026-11-16", constraint="SNET"),         # a constraint that changes nothing
+    ], links)
+
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    hints = {task.uid: (task.earliest, task.start_mode) for task in plan.tasks}
+    assert hints == {
+        1: ("", "no_earlier"), 2: ("", "no_earlier"), 3: ("2026-11-26", "no_earlier"),
+        4: ("2026-11-17", "fixed"), 5: ("2026-11-30", "fixed"), 6: ("2026-12-01", "fixed"),
+        7: ("2026-11-17", "fixed"), 8: ("", "no_earlier"),
+    }
+    assert notes == [
+        "Tasks fixed at their file dates because Project records them as 1 started, 1 manually scheduled, "
+        "1 Must Start On: 3. Predecessors do not move them",
+        "Tasks also fixed at their file dates because the file starts them before their predecessors "
+        "allow: 1; the first is Task 7 (2026-11-17)",
+        "Fixed tasks that start before their predecessors finish, as in the file: 2. "
+        "The links are kept; the first is Task 4",
+    ]
+    assert sorted(start_conflicts(plan)) == [4, 7]
+    # Every leaf lands on the date the file stored.
+    assert {uid: item.start.date().isoformat() for uid, item in schedule(plan).items()} == {
+        1: "2026-11-16", 2: "2026-11-19", 3: "2026-11-26", 4: "2026-11-17",
+        5: "2026-11-30", 6: "2026-12-01", 7: "2026-11-17", 8: "2026-11-16"}
+
+
+def test_imported_links_drive_tasks_that_have_no_hint(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16", 3), _source_task(2, "2026-11-19")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert not notes and plan.tasks[1].earliest == ""
+    plan.tasks[0].duration = 5                                    # lengthen the lead-in
+    assert schedule(plan)[2].start.date().isoformat() == "2026-11-23"   # the follower moves with it
+
+
+def test_a_summary_task_never_gets_a_start_hint(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    phase = _source_task(1, "2026-11-16", 2, percent=50, manual=True)
+    child = _source_task(2, "2026-11-16", 2, percent=50)
+    child.parent_uid = 1
+    _stand_in(monkeypatch, [phase, child], [])
+    plan, _ = import_mpp(tmp_path / "ignored.mpp")
+    assert (plan.tasks[0].earliest, plan.tasks[0].start_mode) == ("", "no_earlier")
+    assert (plan.tasks[1].earliest, plan.tasks[1].start_mode) == ("2026-11-16", "fixed")
+
+
+def test_export_writes_fixed_starts_as_constraints_and_drops_their_false_warnings(tmp_path, monkeypatch):
+    """No template needed: capture what export hands pymppwriter."""
+    import warnings
+    from onepyproject import mpp
+    from pymppwriter.writer import ScheduleWarning
+
+    captured = {}
+
+    class CapturingWriter:
+        def __init__(self, template):
+            pass
+
+        def write(self, project, destination):
+            captured["project"] = project
+            # What pymppwriter says about a task that starts before its links allow.
+            warnings.warn("task 2 'Pinned' starts 2026-11-17 08:00 but its predecessors put it at "
+                          "2026-11-19 08:00; Project will move it", ScheduleWarning)
+            warnings.warn("task 3 'Floor' starts 2026-11-17 08:00 but its predecessors put it at "
+                          "2026-11-19 08:00; Project will move it", ScheduleWarning)
+            Path(destination).write_bytes(b"")
+
+    monkeypatch.setattr(mpp, "MppWriter", CapturingWriter)
+    monkeypatch.setattr(mpp, "strip_template_resources", lambda writer: None)
+    template = tmp_path / "empty-template.mpp"
+    template.write_bytes(b"")
+    plan = Plan(start="2026-11-16", tasks=[
+        Task(1, "Lead in", duration=3),
+        Task(2, "Pinned", duration=1, predecessors=[1], earliest="2026-11-17", start_mode="fixed"),
+        Task(3, "Floor", duration=1, predecessors=[1], earliest="2026-11-17"),
+        Task(4, "Started", duration=2, predecessors=[1], earliest="2026-11-17", start_mode="fixed",
+             percent_complete=50),
+        Task(5, "Free", duration=1)])
+    notes = export_mpp(plan, template, tmp_path / "out.mpp")
+    by_uid = {t.uid: t for t in captured["project"].tasks}
+    assert (by_uid[2].constraint, by_uid[2].constraint_date) == ("MSO", datetime(2026, 11, 17, 8))
+    # Progress is written by pymppwriter as an actual start, so no constraint is added.
+    assert by_uid[4].constraint is None and by_uid[4].percent_complete == 50
+    assert by_uid[1].constraint is None and by_uid[3].constraint is None and by_uid[5].constraint is None
+    assert notes == [
+        "Fixed tasks that start before their predecessors finish: 2. The links are written unchanged and the "
+        "fixed dates are kept",
+        "task 3 'Floor' starts 2026-11-17 08:00 but its predecessors put it at 2026-11-19 08:00; "
+        "Project will move it",
+    ]
+
+
+@pytest.mark.parametrize("unit, raw, expected", [
+    (3, 150, "1FS+15m"),
+    (5, 6000, "1FS+10h"),
+    (7, -4800, "1FS-1d"),
+    (9, -216000, "1FS-9w"),            # a nine-week lead, as in a real file
+    (9, -48000, "1FS-2w"),
+    (11, 96000, "1FS+1mo"),
+])
+def test_import_keeps_working_time_lags_in_the_unit_the_file_shows(tmp_path, monkeypatch, unit, raw, expected):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+    from onepyproject.dependencies import lag_minutes
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, unit, raw)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [expected]
+    assert not [note for note in notes if "omitted" in note]
+    # The scheduler must read the lag as the same working minutes the file stores (tenths of a minute).
+    minutes, elapsed = lag_minutes(parse_dependency(plan.tasks[1].predecessors[0]), 0)
+    assert minutes == pytest.approx(raw / 10) and not elapsed
+
+
+@pytest.mark.parametrize("unit", [4, 6, 8, 10, 12, 19, 20])
+def test_import_still_omits_lags_that_are_not_working_time(tmp_path, monkeypatch, unit):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, unit, 4800)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert not plan.tasks[1].predecessors
+    assert f"Task 2: omitted dependency 1 with unsupported MPP link type or lag unit ({unit})" in notes
+
+
+def test_import_accepts_a_zero_lag_whatever_its_unit(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")],
+              [NS(pred_uid=1, succ_uid=2, type="FS")])
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 8, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_merges_identical_duplicate_links(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    # A real file held two identical finish-to-start records between the same two tasks.
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: merged duplicate dependency on 1" in notes
+    assert not [note for note in notes if "omitted" in note]
+
+
+def test_import_keeps_the_first_of_differing_duplicate_links_and_says_so(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=2, type="FS"), NS(pred_uid=1, succ_uid=2, type="SS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 2, 1, 7, 0), (1, 2, 2, 7, 9600)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[1].predecessors == [1]
+    assert "Task 2: omitted a second dependency on 1 (SS+2d); kept FS" in notes
+
+
+def test_import_keeps_links_to_different_predecessors(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from onepyproject import mpp
+
+    relations = [NS(pred_uid=1, succ_uid=3, type="FS"), NS(pred_uid=2, succ_uid=3, type="FS")]
+    _stand_in(monkeypatch, [_source_task(1, "2026-11-16"), _source_task(2, "2026-11-16"),
+                            _source_task(3, "2026-11-17")], relations)
+    monkeypatch.setattr(mpp, "_mpp_relation_records", lambda path: [(1, 3, 1, 7, 0), (2, 3, 1, 7, 0)])
+    plan, notes = import_mpp(tmp_path / "ignored.mpp")
+    assert plan.tasks[2].predecessors == [1, 2]
+    assert not [note for note in notes if "duplicate" in note]

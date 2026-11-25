@@ -10,7 +10,7 @@ import math
 import re
 
 from ..dependencies import Dependency, format_dependency, parse_dependency, task_numbers
-from ..model import Plan, Resource, ResourceAssignment, Task, descendants, schedule
+from ..model import Plan, Resource, ResourceAssignment, Task, completion_percentages, descendants, schedule
 from ..resources import migrate_legacy_resources, overallocation_warnings
 
 
@@ -87,6 +87,7 @@ def plan_revision(plan: Plan) -> str:
 def make_snapshot(plan: Plan) -> Snapshot:
     baseline = copy.deepcopy(plan)
     calculated = schedule(baseline)
+    progress = completion_percentages(baseline, calculated)
     revision = plan_revision(baseline)
     numbers = task_numbers(baseline.tasks)
     rows = []
@@ -96,13 +97,16 @@ def make_snapshot(plan: Plan) -> Snapshot:
             "ref": f"task:{task.uid}", "display_id": numbers[task.uid], "name": task.name,
             "parent": f"task:{task.parent}" if task.parent else None,
             "duration_days": task.duration, "earliest_date": task.earliest or None,
-            "mode": task.mode, "work_hours": task.work, "estimated": task.estimated,
+            "start_rule": task.start_mode, "mode": task.mode, "work_hours": task.work, "estimated": task.estimated,
+            "percent_complete": task.percent_complete,
+            "collapsed_summary_color": task.summary_color or None,
             "assignments": [{"resource": f"resource:{a.resource_uid}", "units_percent": a.units} for a in task.assignments],
             "legacy_resource": task.resource or None, "legacy_units_percent": task.units if task.resource else None,
             "predecessors": [{"task": f"task:{link.uid}", "kind": link.kind, "lag": link.lag, "unit": link.unit}
                              for link in map(parse_dependency, task.predecessors)],
             "calculated": {"start": item.start.isoformat(), "finish": item.finish.isoformat(),
-                           "duration_days": item.duration, "work_hours": item.work, "summary": item.summary},
+                           "duration_days": item.duration, "work_hours": item.work, "summary": item.summary,
+                           "percent_complete": progress[task.uid]},
         })
     normalized = copy.deepcopy(baseline)
     migrate_legacy_resources(normalized)
@@ -312,7 +316,7 @@ def apply_operations(snapshot: Snapshot, proposal: dict, *, reserved_task_ids=()
             mode = operation["mode"] or "duration"
             if mode not in ("duration", "work"):
                 raise ProposalError("Task mode must be duration or work.")
-            if (mode == "work" and operation["duration_days"] is not None) or (mode == "duration" and operation["work_hours"] is not None):
+            if (mode == "work" and operation["duration_days"] is not None) or (mode != "work" and operation["work_hours"] is not None):
                 raise ProposalError("Supply only the editable work or duration for the selected task mode.")
             task = Task(uid, _name(operation["name"], "Task"), mode=mode)
             if operation["duration_days"] is not None:
@@ -342,19 +346,21 @@ def apply_operations(snapshot: Snapshot, proposal: dict, *, reserved_task_ids=()
                 raise ProposalError("The task update has no changes.")
             if operation["name"] is not None:
                 task.name = _name(operation["name"], "Task")
+            # The assistant may only choose duration or work, but a task already in fixed-units
+            # mode (from an MPP import) keeps that mode, with duration as its editable value.
             new_mode = operation["mode"] if operation["mode"] is not None else task.mode
-            if new_mode not in ("duration", "work"):
+            if new_mode not in ("duration", "work") and not (new_mode == "units" and operation["mode"] is None):
                 raise ProposalError("Task mode must be duration or work.")
             if new_mode != task.mode and ((new_mode == "work" and operation["work_hours"] is None)
                                           or (new_mode == "duration" and operation["duration_days"] is None)):
                 raise ProposalError("Changing task mode requires an explicit work or duration value.")
             if operation["duration_days"] is not None:
-                if new_mode != "duration":
+                if new_mode == "work":
                     raise ProposalError("Duration is calculated for fixed-work tasks.")
                 task.duration = _number(operation["duration_days"], "Duration", 0, 100000)
             if operation["work_hours"] is not None:
                 if new_mode != "work":
-                    raise ProposalError("Work is calculated for fixed-duration tasks.")
+                    raise ProposalError("Work is calculated for fixed-duration and fixed-units tasks.")
                 task.work = _number(operation["work_hours"], "Work", 0, 800000)
             if ((operation["duration_days"] is not None and task.duration != previous_duration)
                     or (operation["work_hours"] is not None and task.work != previous_work)
@@ -363,6 +369,8 @@ def apply_operations(snapshot: Snapshot, proposal: dict, *, reserved_task_ids=()
             task.mode = new_mode
             if operation["earliest"] is not None:
                 task.earliest = _date(operation["earliest"], allow_empty=True)
+                if not task.earliest:
+                    task.start_mode = "no_earlier"  # Clearing the date releases a fixed start.
             if operation["estimated"] is not None:
                 task.estimated = operation["estimated"]
                 if (operation["estimated"] and not previous_estimate
