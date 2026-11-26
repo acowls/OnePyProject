@@ -15,7 +15,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = runpy.run_path(str(ROOT / "onepyproject" / "__init__.py"))["__version__"]
-TARGETS = ("macos-arm64", "macos-x64", "windows-x64")
+TARGETS = ("macos-arm64", "windows-x64")
 PRIVATE_EXTENSIONS = {".mpp", ".mpt", ".pxplan"}
 
 
