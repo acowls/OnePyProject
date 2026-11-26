@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="background" x1="24" y1="20" x2="232" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#244c70"/>
+      <stop offset="1" stop-color="#10283f"/>
+    </linearGradient>
+    <linearGradient id="header" x1="65" y1="63" x2="194" y2="111" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#55a5e4"/>
+      <stop offset="1" stop-color="#2874b8"/>
+    </linearGradient>
+    <filter id="shadow" x="35" y="39" width="186" height="190" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feFlood flood-opacity="0" result="backgroundFix"/>
+      <feColorMatrix in="SourceAlpha" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+      <feOffset dy="5"/>
+      <feGaussianBlur stdDeviation="7"/>
+      <feComposite in2="SourceAlpha" operator="out"/>
+      <feColorMatrix values="0 0 0 0 0.02 0 0 0 0 0.08 0 0 0 0 0.15 0 0 0 0.28 0"/>
+      <feBlend in2="backgroundFix" result="effect"/>
+      <feBlend in="SourceGraphic" in2="effect" result="shape"/>
+    </filter>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#background)"/>
+  <path d="M33 192c36 28 112 47 190-2" fill="none" stroke="#91c8ed" stroke-opacity=".12" stroke-width="18" stroke-linecap="round"/>
+  <g filter="url(#shadow)">
+    <rect x="52" y="54" width="152" height="150" rx="20" fill="#f7fbff"/>
+    <path d="M52 74c0-11.046 8.954-20 20-20h112c11.046 0 20 8.954 20 20v35H52V74Z" fill="url(#header)"/>
+    <rect x="82" y="43" width="12" height="35" rx="6" fill="#eaf5ff"/>
+    <rect x="162" y="43" width="12" height="35" rx="6" fill="#eaf5ff"/>
+    <circle cx="88" cy="94" r="3" fill="#d9edfc"/>
+    <circle cx="128" cy="94" r="3" fill="#d9edfc"/>
+    <circle cx="168" cy="94" r="3" fill="#d9edfc"/>
+    <path d="M72 128h112" stroke="#dce7f0" stroke-width="2" stroke-linecap="round"/>
+    <path d="M72 158h112" stroke="#dce7f0" stroke-width="2" stroke-linecap="round"/>
+    <path d="M72 186h112" stroke="#dce7f0" stroke-width="2" stroke-linecap="round"/>
+    <rect x="72" y="119" width="53" height="11" rx="5.5" fill="#367fb9"/>
+    <rect x="105" y="149" width="67" height="11" rx="5.5" fill="#45a985"/>
+    <rect x="84" y="177" width="39" height="11" rx="5.5" fill="#e3a642"/>
+    <path d="m184 149 9 5-9 5-9-5 9-5Z" fill="#e3a642"/>
+  </g>
+</svg>

@@ -64,3 +64,13 @@ def test_source_packaging_smoke(tmp_path):
     )
     assert result.returncode == 0, report.read_text(encoding="utf-8") if report.exists() else result.stderr
     assert report.read_text(encoding="utf-8").strip() == f"Packaging smoke test passed: {__version__}."
+
+
+def test_native_application_icons_are_valid():
+    icon_dir = ROOT / "packaging" / "icons"
+    windows_icon = (icon_dir / "OnePyProject.ico").read_bytes()
+    macos_icon = (icon_dir / "OnePyProject.icns").read_bytes()
+    assert windows_icon[:4] == b"\x00\x00\x01\x00"
+    assert int.from_bytes(windows_icon[4:6], "little") > 0
+    assert macos_icon[:4] == b"icns"
+    assert int.from_bytes(macos_icon[4:8], "big") == len(macos_icon)

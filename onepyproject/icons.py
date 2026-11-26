@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QStyle
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets" / "flat_color_icons"
+APPLICATION_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.svg"
 ICON_FILES = {
     "new": "file.svg",
     "open": "opened_folder.svg",
@@ -27,6 +28,11 @@ ICON_FILES = {
     "resources": "business_contact.svg",
     "assign": "collaboration.svg",
 }
+
+
+def application_icon() -> QIcon:
+    """Return the OnePyProject icon used by the window and application."""
+    return QIcon(str(APPLICATION_ICON_PATH))
 
 
 def toolbar_icon(name: str) -> QIcon:
