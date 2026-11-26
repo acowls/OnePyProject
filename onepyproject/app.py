@@ -25,7 +25,7 @@ from .model import (MODE_LABELS, MODE_NAMES, MODES, START_MODE_LABELS, START_MOD
                     completion_percentages, descendants, estimated_tasks, indent, load_plan, outdent, save_plan,
                     schedule, start_conflicts, total_units)
 from .dependencies import parse_dependency, parse_display_predecessors, remap_predecessors, task_numbers
-from .icons import toolbar_icon
+from .icons import application_icon, toolbar_icon
 from .mpp import EXPORT_WARNING, IMPORT_WARNING, export_mpp, import_mpp
 from .resources import format_task_resources, migrate_legacy_resources, overallocation_warnings, set_task_resources
 from .workcalendar import format_period, parse_periods
@@ -1113,6 +1113,7 @@ class MainWindow(QMainWindow):
         saved_zoom = self.preferences.value("display/zoom_width", 26, type=int)
         self.zoom_index = self.ZOOM_STEPS.index(saved_zoom) if saved_zoom in self.ZOOM_STEPS else self.ZOOM_STEPS.index(26)
         self.setWindowTitle(f"OnePyProject {__version__}")
+        self.setWindowIcon(application_icon())
         self.resize(1450, 800)
 
         self.file_toolbar = QToolBar("File")
@@ -2093,6 +2094,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(application_icon())
     app.aboutToQuit.connect(release_rows)
     app.setApplicationName("OnePyProject")
     app.setApplicationVersion(__version__)

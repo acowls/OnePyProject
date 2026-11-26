@@ -23,7 +23,7 @@ include = ["onepyproject*"]
 version = {attr = "onepyproject.__version__"}
 
 [tool.setuptools.package-data]
-onepyproject = ["assets/flat_color_icons/*.svg", "assets/flat_color_icons/*.txt", "assets/ui/*.svg"]
+onepyproject = ["assets/app_icon.svg", "assets/flat_color_icons/*.svg", "assets/flat_color_icons/*.txt", "assets/ui/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

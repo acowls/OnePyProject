@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QComboBox
 import pymppwriter
 from . import __version__
 from .app import ExportDialog, MainWindow, SettingsDialog, display_time
-from .icons import ASSET_DIR, ICON_FILES
+from .icons import APPLICATION_ICON_PATH, ASSET_DIR, ICON_FILES, application_icon
 from .model import Plan, Resource, ResourceAssignment, Task, load_plan, save_plan
 from .mpp import export_mpp, import_mpp
 from .report import export_html
@@ -38,6 +38,9 @@ def run():
         raise RuntimeError("pymppwriter lacks the fixes OnePyProject needs; build against the pinned fork commit")
 
     # Bypass toolbar_icon's fallback so missing SVG plugins cannot pass silently.
+    app_icon = application_icon()
+    if not APPLICATION_ICON_PATH.is_file() or app_icon.pixmap(QSize(128, 128)).isNull():
+        raise RuntimeError("Application icon failed to render")
     for filename in ICON_FILES.values():
         image = QIcon(str(ASSET_DIR / filename)).pixmap(QSize(20, 20), 2.0).toImage()
         if image.isNull() or not any(
@@ -132,6 +135,8 @@ def run():
                 raise RuntimeError("MPP template changed during smoke test")
         preferences = QSettings(str(directory / "settings.ini"), QSettings.Format.IniFormat)
         window = MainWindow(preferences)
+        if window.windowIcon().pixmap(QSize(128, 128)).isNull():
+            raise RuntimeError("Main window application icon failed to render")
         window.plan = plan
         window.show()
         window.refresh()
