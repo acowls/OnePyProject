@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, QProcess, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
-                               QPushButton, QToolButton, QVBoxLayout, QWidget)
+                               QPushButton, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from .diff import compare_plans
 from .mentions import ResourceMentionEdit
@@ -370,15 +370,34 @@ class AIAssistantDock(QDockWidget):
         content.setStyleSheet("""
             QWidget { color: #24354a; background: #f5f7fa; }
             QPlainTextEdit { color: #24354a; background: #ffffff; border: 1px solid #b9c7d2; border-radius: 3px; padding: 4px; }
+            QPlainTextEdit#ai_response { background: transparent; border: 0; padding: 4px 2px; }
             QPushButton { color: #17334a; background: #e8f0f6; border: 1px solid #a3b3bf; border-radius: 4px; padding: 5px; }
             QPushButton:hover { background: #d2e5f3; }
             QPushButton:disabled { color: #81909d; background: #e3e8ec; }
+            QWidget#ai_composer { background: #ffffff; border: 1px solid #d6dee5; border-radius: 14px; }
+            QWidget#ai_composer:hover { border-color: #c5d1da; }
+            QPlainTextEdit#ai_prompt { color: #24354a; background: transparent; border: 0; padding: 5px 6px; }
+            QWidget#ai_composer QToolButton {
+                color: #53616d; background: transparent; border: 0; border-radius: 7px; padding: 5px;
+            }
+            QWidget#ai_composer QToolButton:hover { background: #edf2f6; }
+            QWidget#ai_composer QToolButton:pressed { background: #e2eaf0; }
+            QToolButton#ai_model_button, QToolButton#ai_effort_button {
+                background: transparent; border: 0; border-radius: 7px; padding: 5px 6px;
+            }
+            QToolButton#ai_model_button { color: #405363; font-weight: 600; }
+            QToolButton#ai_effort_button { color: #b95d2d; font-weight: 600; }
+            QToolButton#ai_model_button:hover, QToolButton#ai_effort_button:hover { background: #edf2f6; }
+            QToolButton#ai_model_button::menu-indicator, QToolButton#ai_effort_button::menu-indicator {
+                image: none; width: 0;
+            }
         """)
         layout = QVBoxLayout(content)
         self.usage = QLabel("Tokens: not reported")
         self.usage.setWordWrap(True)
         layout.addWidget(self.usage)
         self.response = QPlainTextEdit()
+        self.response.setObjectName("ai_response")
         self.response.setReadOnly(True)
         self.response.setAccessibleName("AI session conversation")
         layout.addWidget(self.response, 1)
@@ -404,12 +423,20 @@ class AIAssistantDock(QDockWidget):
         proposal_actions.addWidget(self.accept)
         layout.addLayout(proposal_actions)
         self.prompt = ResourceMentionEdit(self.window)
+        self.prompt.setObjectName("ai_prompt")
         self.prompt.setPlaceholderText("Ask for a change or refine the preview…")
         self.prompt.setAccessibleName("Ask AI")
         self.prompt.setMaximumHeight(110)
         _readable_placeholder(self.prompt)
-        layout.addWidget(self.prompt)
+        composer = QWidget()
+        composer.setObjectName("ai_composer")
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(9, 7, 9, 6)
+        composer_layout.setSpacing(3)
+        composer_layout.addWidget(self.prompt)
         controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(3)
         self.settings_button = QToolButton()
         self.settings_button.setIcon(QIcon(str(Path(__file__).resolve().parent.parent / "assets" / "flat_color_icons" / "settings.svg")))
         self.settings_button.setAccessibleName("AI settings")
@@ -428,24 +455,34 @@ class AIAssistantDock(QDockWidget):
             controls.addWidget(button)
         controls.addStretch()
         self.model_button = QToolButton()
+        self.model_button.setObjectName("ai_model_button")
         self.model_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.model_button.setAccessibleName("Select AI model")
         self.model_menu = QMenu(self.model_button)
         self.model_menu.aboutToShow.connect(self._populate_models)
         self.model_button.setMenu(self.model_menu)
+        self.model_menu.setMinimumWidth(260)
+        self.model_menu.setStyleSheet(self._selector_menu_style())
         controls.addWidget(self.model_button)
+        self.model_effort_separator = QLabel("/")
+        self.model_effort_separator.setStyleSheet("color: #97a3ad; background: transparent;")
+        controls.addWidget(self.model_effort_separator)
         self.effort_button = QToolButton()
+        self.effort_button.setObjectName("ai_effort_button")
         self.effort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.effort_button.setAccessibleName("Select reasoning effort")
         self.effort_menu = QMenu(self.effort_button)
         self.effort_menu.aboutToShow.connect(self._populate_efforts)
         self.effort_button.setMenu(self.effort_menu)
+        self.effort_menu.setMinimumWidth(190)
+        self.effort_menu.setStyleSheet(self._selector_menu_style())
         controls.addWidget(self.effort_button)
         self.send = QToolButton()
         self.send.setIconSize(QSize(20, 20))
         self.send.clicked.connect(self._send_or_stop)
         controls.addWidget(self.send)
-        layout.addLayout(controls)
+        composer_layout.addLayout(controls)
+        layout.addWidget(composer)
         self.setWidget(content)
         self._update_controls()
         self._set_buttons()
@@ -453,13 +490,37 @@ class AIAssistantDock(QDockWidget):
     def _append(self, who, text):
         self.response.appendPlainText(f"{who}:\n{text}\n")
 
+    @staticmethod
+    def _selector_menu_style():
+        return """
+            QMenu { background: #ffffff; border: 1px solid #d6dee5; border-radius: 11px; padding: 6px; }
+            QMenu::item { color: #34495a; padding: 7px 26px 7px 11px; border-radius: 6px; }
+            QMenu::item:selected { color: #21394d; background: #eaf1f6; }
+            QMenu::item:checked { font-weight: 600; }
+            QMenu::item:disabled { color: #8996a0; }
+            QMenu::separator { height: 1px; background: #e7edf1; margin: 5px 7px; }
+            QLineEdit { color: #34495a; background: #f7f9fb; border: 1px solid #d6dee5;
+                        border-radius: 7px; padding: 6px 8px; margin: 3px; }
+            QLineEdit:focus { border-color: #9aafbf; }
+        """
+
+    @staticmethod
+    def _add_selector_heading(menu, text):
+        label = QLabel(text)
+        label.setStyleSheet("QLabel { color: #7b8994; background: transparent; font-size: 10px; "
+                            "font-weight: 600; letter-spacing: 0.6px; padding: 4px 8px 3px; }")
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(label)
+        menu.addAction(action)
+
     def _update_controls(self):
         try:
             config = _current_config(self.window.preferences)
             model = _model_name(config)
         except ProviderError:
             model = ""
-        self.model_button.setText(self.model_button.fontMetrics().elidedText(model or "Choose model", Qt.TextElideMode.ElideRight, 110))
+        self.model_button.setText(self.model_button.fontMetrics().elidedText(model or "Choose model", Qt.TextElideMode.ElideRight, 118))
+        self.model_button.setMaximumWidth(144)
         provider = _provider(self.window.preferences)
         self.model_button.setToolTip(f"Select a {('Gemini model' if provider == 'gemini' else 'Foundry deployment')}: {model}"
                                      if model else "Choose a model in AI settings")
@@ -498,44 +559,78 @@ class AIAssistantDock(QDockWidget):
     def _populate_efforts(self):
         self.effort_menu.clear()
         efforts = EFFORTS if _provider(self.window.preferences) == "foundry" else ("minimal", "low", "medium", "high")
+        self._add_selector_heading(self.effort_menu, "REASONING EFFORT")
         for effort in (None, *efforts):
-            action = self.effort_menu.addAction(effort or "Model default")
+            label = "Model default" if effort is None else effort.replace("xhigh", "Extra high").title()
+            action = self.effort_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(self.effort == effort)
+            action.setToolTip("Use the model's configured default" if effort is None else f"Set reasoning effort to {effort}")
             action.triggered.connect(lambda checked=False, value=effort: self.select_effort(value))
 
     def _populate_models(self):
         menu = self.model_menu
         menu.clear()
+        search = QLineEdit(menu)
+        search.setClearButtonEnabled(True)
+        search.setPlaceholderText("Search models")
+        search.setAccessibleName("Search AI models")
+        search_action = QWidgetAction(menu)
+        search_action.setDefaultWidget(search)
+        menu.addAction(search_action)
+        self.model_search = search
+        menu.addSeparator()
+        self._add_selector_heading(menu, "MODELS")
+        self._no_model_match = menu.addAction("No matching models")
+        self._no_model_match.setEnabled(False)
+        self._no_model_match.setVisible(False)
         try:
             config = _current_config(self.window.preferences)
             if _provider(self.window.preferences) == "gemini":
                 current = menu.addAction(config.model)
                 current.setCheckable(True)
                 current.setChecked(True)
+                current.setProperty("model_choice", True)
                 menu.addSeparator()
                 menu.addAction("Manage Gemini settings…").triggered.connect(self.open_settings)
-                return
-            names = _models(self.window.preferences, config)
-            for name in names:
-                action = menu.addAction(name)
-                action.setCheckable(True)
-                action.setChecked(name == config.deployment)
-                action.triggered.connect(lambda checked=False, value=name: self.select_model(value))
-            if self._discovered_endpoint == config.endpoint:
-                new = [name for name in self._discovered if name not in names]
-                if new:
-                    menu.addSection("Foundry models — verify deployment")
-                    for name in new:
-                        action = menu.addAction(name)
-                        action.triggered.connect(lambda checked=False, value=name: self.select_model(value))
-            menu.addSeparator()
-            refresh = menu.addAction("Discover models…")
-            refresh.setEnabled(not self._discovering)
-            refresh.triggered.connect(self.refresh_models)
+            else:
+                names = _models(self.window.preferences, config)
+                for name in names:
+                    action = menu.addAction(name)
+                    action.setCheckable(True)
+                    action.setChecked(name == config.deployment)
+                    action.setProperty("model_choice", True)
+                    action.triggered.connect(lambda checked=False, value=name: self.select_model(value))
+                if self._discovered_endpoint == config.endpoint:
+                    new = [name for name in self._discovered if name not in names]
+                    if new:
+                        menu.addSeparator()
+                        self._add_selector_heading(menu, "DISCOVERED MODELS · VERIFY DEPLOYMENT")
+                        for name in new:
+                            action = menu.addAction(name)
+                            action.setProperty("model_choice", True)
+                            action.triggered.connect(lambda checked=False, value=name: self.select_model(value))
+                menu.addSeparator()
+                refresh = menu.addAction("Discover models…")
+                refresh.setEnabled(not self._discovering)
+                refresh.triggered.connect(self.refresh_models)
         except ProviderError:
-            pass
-        menu.addAction("Manage deployments…").triggered.connect(self.open_settings)
+            setup = menu.addAction("Choose a model in AI settings")
+            setup.setEnabled(False)
+        if _provider(self.window.preferences) == "foundry":
+            menu.addAction("Manage deployments…").triggered.connect(self.open_settings)
+        search.textChanged.connect(self._filter_model_choices)
+        self._filter_model_choices(search.text())
+
+    def _filter_model_choices(self, text):
+        query = text.strip().casefold()
+        choices = [action for action in self.model_menu.actions() if action.property("model_choice")]
+        visible_count = 0
+        for action in choices:
+            visible = query in action.text().casefold()
+            action.setVisible(visible)
+            visible_count += visible
+        self._no_model_match.setVisible(bool(query) and not visible_count)
 
     def select_model(self, name):
         if self._busy:

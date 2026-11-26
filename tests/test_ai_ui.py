@@ -435,6 +435,28 @@ def test_model_and_effort_selection_are_sent_with_followup(window, monkeypatch, 
     assert "second-deployment" in [action.text() for action in assistant.model_menu.actions()]
 
 
+def test_ai_composer_has_searchable_model_and_effort_selectors(window):
+    assistant, config = configured(window)
+    assistant.select_model("second-deployment")
+    assistant.select_model(config.deployment)
+    assistant._populate_models()
+
+    assert assistant.prompt.parentWidget().objectName() == "ai_composer"
+    assert "QPlainTextEdit#ai_prompt" in assistant.widget().styleSheet()
+    assert assistant.response.objectName() == "ai_response"
+    assert "QPlainTextEdit#ai_response" in assistant.widget().styleSheet()
+    assert "::menu-indicator" in assistant.widget().styleSheet()
+    assert assistant.model_search.placeholderText() == "Search models"
+    choices = [action for action in assistant.model_menu.actions() if action.property("model_choice")]
+    assistant.model_search.setText("second")
+    assert [action.text() for action in choices if action.isVisible()] == ["second-deployment"]
+
+    assistant._populate_efforts()
+    assert [action.text() for action in assistant.effort_menu.actions() if action.isCheckable()] == [
+        "Model default", "None", "Minimal", "Low", "Medium", "High", "Extra High"
+    ]
+
+
 def test_discovered_models_can_be_selected_and_are_saved(window, monkeypatch, app):
     assistant, config = configured(window)
     monkeypatch.setattr("onepyproject.ai.ui.discover_models", lambda config, key: ["discovered-model"])
