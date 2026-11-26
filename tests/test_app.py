@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QColorDialog, QDialog, Q
 from onepyproject.app import (COLUMN_WIDTH_KEY, EMPTY_ROW_HINT, OPTIONAL_COLUMNS, SUMMARY_PALETTE, SUMMARY_PALETTE_NAMES,
                               TASK_COLUMN_KEYS, ExportDialog,
                               MainWindow, SettingsDialog, TaskDialog, collapsed_summary_color, display_time, summary_color)
-from onepyproject.icons import ASSET_DIR, ICON_FILES, toolbar_icon
+from onepyproject.icons import APPLICATION_ICON_PATH, ASSET_DIR, ICON_FILES, application_icon, toolbar_icon
 from onepyproject.model import Plan, Task, load_plan, save_plan, schedule
 from onepyproject.mpp import import_mpp
 from onepyproject.ui_preferences import DEFAULT_DENSITY, DENSITY_HEIGHTS, DENSITY_PREFERENCE_KEY
@@ -629,6 +629,10 @@ def test_mode_editor_escape_cancels_and_unassigned_work_is_rejected(app, tmp_pat
 
 def test_toolbar_actions_are_icon_only_with_accessible_names(app, tmp_path):
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    assert APPLICATION_ICON_PATH.is_file()
+    assert not application_icon().pixmap(QSize(64, 64)).isNull()
+    assert not window.windowIcon().isNull()
+    assert not window.windowIcon().pixmap(QSize(64, 64)).isNull()
     file_actions = [action for action in window.file_toolbar.actions() if action.text()]
     task_actions = [action for action in window.task_toolbar.actions() if action.text()]
     assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ["File", "Project"]

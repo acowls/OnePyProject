@@ -5,6 +5,8 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 root = Path(SPECPATH).parent
+app_icon_name = "OnePyProject.ico" if sys.platform == "win32" else "OnePyProject.icns"
+app_icon = root / "packaging" / "icons" / app_icon_name
 datas = [
     (str(root / "onepyproject" / "assets"), "onepyproject/assets"),
     (str(root / "packaging" / "THIRD_PARTY_NOTICES.md"), "."),
@@ -41,6 +43,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="OnePyProject",
+    icon=str(app_icon),
     debug=False,
     strip=False,
     upx=False,
@@ -58,5 +61,6 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="OnePyProject.app",
+        icon=str(app_icon),
         bundle_identifier="com.onepyproject.OnePyProject",
     )
