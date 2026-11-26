@@ -22,6 +22,10 @@ def make_fake_bundle(path):
     return path
 
 
+def test_packaging_targets_exclude_macos_intel():
+    assert packaging.TARGETS == ("macos-arm64", "windows-x64")
+
+
 @pytest.mark.parametrize("filename", ["template.MPP", "other.Mpt", "personal.PxPlan"])
 def test_package_rejects_personal_projects(tmp_path, filename):
     bundle = make_fake_bundle(tmp_path / "bundle")
