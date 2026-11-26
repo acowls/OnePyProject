@@ -1,6 +1,6 @@
 # OnePyProject
 
-An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The current version is **0.1.0a1** (the first 0.1.0 alpha). The editable OnePyProject plan (`.pxplan`) is separate from `MPP` interchange that can also be read and written.
+An experimental offline project planner for Windows 11 and macOS, built with Python, Qt and pymppwriter. The current source version is **0.2.1**. The editable OnePyProject plan (`.pxplan`) is separate from `MPP` interchange that can also be read and written.
 
 ## Run from source
 
@@ -69,11 +69,11 @@ The **PR checks** workflow runs tests, dependency vulnerability and PR dependenc
 
 The **Protected-tag desktop release** workflow builds macOS Apple Silicon, macOS Intel and Windows x64 from a release tag. It verifies that the tag is annotated, points to a commit on `main`, and matches the version in `onepyproject/__init__.py`. It then smoke-tests the packages, creates build-provenance attestations and checksums, and opens a **draft** GitHub Release for review.
 
-To prepare a release, update the version (for example, `0.1.0a1`), merge it through the protected `main` branch, then create and push an annotated tag at that commit:
+To prepare a release, update the version, merge it through the protected `main` branch, then create and push an annotated tag matching it. For version `0.2.1`:
 
 ```bash
-git tag -a v0.1.0a1 -m "Release v0.1.0a1"
-git push origin v0.1.0a1
+git tag -a v0.2.1 -m "Release v0.2.1"
+git push origin v0.2.1
 ```
 
 In GitHub, add a tag ruleset for `v*` that restricts who can create, update or delete release tags. Configure the `release` environment with required reviewer approval; after the workflow creates the draft, review it and publish it manually. Artifacts can be verified with `gh attestation verify <archive.zip> --repo acowls/OnePyProject`.
