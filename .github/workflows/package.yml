@@ -1,4 +1,4 @@
-name: Private desktop builds
+name: Manual desktop validation builds (not a release)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -27,27 +28,45 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.12'
           architecture: ${{ matrix.architecture }}
       - name: Install clean build dependencies
         run: python -m pip install -e '.[dev]' -r packaging/requirements-build.txt
-      - name: Identify version
-        id: version
-        shell: bash
-        run: echo "version=$(python -c 'from onepyproject import __version__; print(__version__)')" >> "$GITHUB_OUTPUT"
       - name: Test source
         run: python -m pytest -q
       - name: Build application
         run: python -m PyInstaller --noconfirm packaging/OnePyProject.spec
       - name: Package and test extracted application
         run: python packaging/package_artifact.py ${{ matrix.target }}
-      - name: Upload private test artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload validation artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: OnePyProject-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          name: OnePyProject-${{ github.sha }}-${{ matrix.target }}
           path: artifacts/*.zip
           if-no-files-found: error
           retention-days: 7
+
+  attest:
+    name: Attest validation builds
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: OnePyProject-${{ github.sha }}-*
+          path: artifacts
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: artifacts/*.zip

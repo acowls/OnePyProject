@@ -65,14 +65,20 @@ The optional integration test uses `template.mpp` if present and writes only to 
 
 ## Packaging
 
-The manual **Private desktop builds** GitHub Actions workflow builds macOS Apple Silicon, macOS Intel and Windows x64 separately. To build the current alpha:
+The **PR checks** workflow runs tests, dependency vulnerability and PR dependency review, and CodeQL. Require the `Tests`, `Dependency audit`, `Dependency review`, and `CodeQL` checks in the `main` ruleset.
 
-1. Commit and push the changes containing the desired version to the branch you want to build.
-2. In the repository on GitHub, open **Actions → Private desktop builds → Run workflow**, select that branch and click **Run workflow**.
-3. Open the completed run and download the matching artifact. Artifact names and `BUILD_INFO.json` include the version; artifacts expire after seven days.
+The **Protected-tag desktop release** workflow builds macOS Apple Silicon, macOS Intel and Windows x64 from a release tag. It verifies that the tag is annotated, points to a commit on `main`, and matches the version in `onepyproject/__init__.py`. It then smoke-tests the packages, creates build-provenance attestations and checksums, and opens a **draft** GitHub Release for review.
 
-The version is defined in `onepyproject/__init__.py` using Python's pre-release format (`0.1.0a1`, `0.1.0a2`, and so on). This workflow builds whatever version is on the selected branch; it does not create a GitHub release. Private-repository runner and artifact usage may incur charges. The macOS builds require macOS 14 or newer. The Windows build runs its automated checks on a Windows Server runner; it still needs testing on Windows 11.
+To prepare a release, update the version (for example, `0.1.0a1`), merge it through the protected `main` branch, then create and push an annotated tag at that commit:
 
+```bash
+git tag -a v0.1.0a1 -m "Release v0.1.0a1"
+git push origin v0.1.0a1
+```
+
+In GitHub, add a tag ruleset for `v*` that restricts who can create, update or delete release tags. Configure the `release` environment with required reviewer approval; after the workflow creates the draft, review it and publish it manually. Artifacts can be verified with `gh attestation verify <archive.zip> --repo acowls/OnePyProject`.
+
+The **Manual desktop validation builds (not a release)** workflow remains available on `main`; its artifacts expire after seven days. Release packages are not code-signed or notarized, and third-party license compliance is not certified. Review `packaging/THIRD_PARTY_NOTICES.md` and signing/notarization requirements before publishing a draft publicly. No installer is provided.
 Each artifact contains a ZIP: extract it fully, then open `OnePyProject.app` on macOS or `OnePyProject/OnePyProject.exe` on Windows. Both builds use the OnePyProject application icon. The app is not signed with a developer identity or notarized, so operating-system security warnings are expected. These are **private test builds, not public releases**. No installer is provided.
 
 To build locally in a clean Python 3.12 environment on the target OS and architecture, install `python -m pip install -e '.[dev]' -r packaging/requirements-build.txt`, run `python -m PyInstaller --noconfirm packaging/OnePyProject.spec`, then run `python packaging/package_artifact.py TARGET` with `macos-arm64`, `macos-x64` or `windows-x64`. The script checks for personal plans and templates, archives the app and runs a noninteractive smoke test on the extracted build. The pinned main build dependencies do not constitute a complete reproducible lockfile.

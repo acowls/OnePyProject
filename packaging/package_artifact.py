@@ -1,4 +1,4 @@
-"""Prepare a private CI artifact and test the extracted executable."""
+"""Build, package, and smoke-test a desktop artifact."""
 import argparse
 import importlib.metadata as metadata
 import json
@@ -114,7 +114,7 @@ def make_artifact(target, dist, output):
                               "keyring", "google-auth", "requests")},
             "pymppwriter_source": distribution_source("pymppwriter"),
             "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
-            "warning": "Private test build; distribution compliance and signing are not validated.",
+            "warning": "This artifact is unsigned; distribution compliance has not been validated.",
         }
         (stage / "BUILD_INFO.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         check_tree(stage)
