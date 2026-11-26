@@ -1,4 +1,4 @@
-# Third-party notices — internal test builds
+# Third-party notices — OnePyProject desktop builds
 
 These builds use Qt for Python (PySide6 Essentials and Shiboken) and Qt 6.12.0.
 The intended choice for applicable Qt/PySide components is LGPL version 3.

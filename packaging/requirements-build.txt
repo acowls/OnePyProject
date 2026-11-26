@@ -1,4 +1,4 @@
-# Versions used for the private CI builds. Runtime dependencies remain declared
+# Versions used for desktop CI builds. Runtime dependencies remain declared
 # in pyproject.toml; this is not a complete, hash-locked dependency set.
 PySide6-Essentials==6.12.0
 shiboken6==6.12.0
