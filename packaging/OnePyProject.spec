@@ -9,11 +9,12 @@ app_icon_name = "OnePyProject.ico" if sys.platform == "win32" else "OnePyProject
 app_icon = root / "packaging" / "icons" / app_icon_name
 datas = [
     (str(root / "onepyproject" / "assets"), "onepyproject/assets"),
-    (str(root / "packaging" / "THIRD_PARTY_NOTICES.md"), "."),
     (str(root / "LICENSE"), "."),
 ]
 datas += collect_data_files("pymppwriter")
 datas += copy_metadata("pymppwriter") + copy_metadata("olefile")
+datas += copy_metadata("onepyproject")
+datas += copy_metadata("PySide6-Essentials") + copy_metadata("shiboken6")
 datas += copy_metadata("openai", recursive=True) + copy_metadata("keyring", recursive=True)
 datas += copy_metadata("google-auth", recursive=True)
 datas += copy_metadata("requests", recursive=True)
