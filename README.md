@@ -87,7 +87,7 @@ To build locally in a clean Python 3.12 environment on the target OS and archite
 
 The CI smoke test checks plan saving, the window, SVG icons, HTML and A4/A3 PDF export, but cannot test MPP import/export without a template. To include that local check, set `ONEPYPROJECT_SMOKE_MPP_TEMPLATE` to your external template's absolute path before running `package_artifact.py`; the test writes a disposable MPP in a temporary directory and checks that the template remains unchanged.
 
-The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. Before distribution, review all bundled third-party licences, required notices and corresponding source, library replacement, signing and notarization. See `packaging/THIRD_PARTY_NOTICES.md`; it is not a complete compliance inventory. Keep `template.mpp` external and select it at export time.
+The packaging uses separate Qt libraries and includes SVG assets and plugins, but this alone does **not** establish LGPL compliance. The native-file inventory and, when generated, the release SBOM make the shipped payload more reviewable; they do not identify every third-party component statically incorporated into Qt libraries or prove license compliance. Review the exact Qt/PySide components, notices, corresponding source, library replacement, signing and notarization before distribution. See `packaging/THIRD_PARTY_NOTICES.md`, `packaging/SOURCES.md`, and `packaging/REPLACING_QT.md`. Keep `template.mpp` external and select it at export time.
 
 ## License
 

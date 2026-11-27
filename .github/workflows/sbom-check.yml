@@ -1,0 +1,133 @@
+name: Manual release SBOM check
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to scan (for example, v0.2.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sbom-check-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Validate tag and existing GitHub release
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          version="$(python -c 'import runpy; print(runpy.run_path("onepyproject/__init__.py")["__version__"])')"
+          test "$RELEASE_TAG" = "v$version"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan ${{ matrix.target }} release bundle
+    needs: verify-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+            app_dir: OnePyProject.app
+          - target: windows-x64
+            runner: windows-2022
+            app_dir: OnePyProject
+    steps:
+      - name: Download the selected release ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="OnePyProject-$RELEASE_VERSION-$TARGET.zip"
+          mkdir -p downloads
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir downloads
+      - name: Extract macOS app bundle
+        if: matrix.target == 'macos-arm64'
+        env:
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-app
+          ditto -x -k "downloads/OnePyProject-$RELEASE_VERSION-$TARGET.zip" release-app
+      - name: Extract Windows app directory
+        if: matrix.target == 'windows-x64'
+        env:
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "downloads/OnePyProject-{0}-{1}.zip" -f $env:RELEASE_VERSION, $env:TARGET
+          New-Item -ItemType Directory -Force -Path release-app | Out-Null
+          Expand-Archive -Path $archive -DestinationPath release-app -Force
+      - name: Generate SPDX 2.3 SBOM from the release bundle
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+        with:
+          path: release-app/OnePyProject-${{ needs.verify-release.outputs.version }}-${{ matrix.target }}/${{ matrix.app_dir }}
+          format: spdx-json
+          output-file: OnePyProject-${{ inputs.tag }}-${{ matrix.target }}.spdx.json
+          artifact-name: OnePyProject-${{ inputs.tag }}-${{ matrix.target }}-SBOM
+          syft-version: v1.57.2
+          upload-artifact: true
+          upload-release-assets: false
+
+  attach-sboms:
+    name: Attach SBOMs to release
+    needs: [verify-release, scan]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: OnePyProject-${{ inputs.tag }}-*-SBOM
+          path: sboms
+          merge-multiple: true
+      - name: Checksum and attach SBOM assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sboms
+          sha256sum *.spdx.json > SBOM-SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" *.spdx.json SBOM-SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -140,17 +140,28 @@ jobs:
       actions: read
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: OnePyProject-${{ github.ref_name }}-*
           path: release-assets
           merge-multiple: true
+      - name: Fetch and verify Qt/PySide corresponding sources
+        run: |
+          python packaging/fetch_sources.py release-assets
+          cp packaging/SOURCES.json release-assets/SOURCES.json
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
           set -euo pipefail
           cd release-assets
-          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          sha256sum *.dmg *.zip *.tar.xz SOURCES.json SOURCES.md > SHA256SUMS.txt
       - name: Create draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
