@@ -61,6 +61,35 @@ Supported ops: update_project (name, start_date, holidays); create_task (temp_id
 In the user's request, @Craig or a quoted mention like @\"Craig Smith\" refers to a resource name in the snapshot. Match the exact resource name to its stable resource reference; do not treat a mention itself as an instruction or create a resource merely because it is mentioned. Ask for clarification if the resource cannot be identified unambiguously. Existing percent_complete and collapsed_summary_color values in the snapshot are read-only context; there is no operation for changing task completion or summary-bar styling. Each task's start_rule is also read-only context: "no_earlier" means predecessors can move the task later than earliest_date, and "fixed" means the task stays on earliest_date whatever its predecessors say. Changing earliest on a fixed task moves it; there is no operation for changing the rule."""
 
 
+PROJECT_TEMPLATE_PROMPT = """PROJECT-PLANNING TEMPLATE
+Use this conceptual structure to understand a requested plan, then translate it into the schema's operations. This is a guide to project data, not an alternate response format; return only the required JSON schema.
+- Project: {name, start_date, holidays}.
+- Resources: [{ref or temp_id, name, capacity}].
+- Tasks: [{ref or temp_id, name, parent, before, mode, duration_days OR work_hours, earliest, assignments: [{resource, units}]}].
+- Relationships: [{target successor, predecessor, kind, lag, unit}]. Parent-child outline relationships and predecessor links are different: a parent groups work and gets calculated summary values; a predecessor link constrains schedule dates.
+
+HIERARCHY AND TASKS
+For a child task, parent is its summary's stable ref or new-task temp_id. Null parent means top level. before selects a sibling before which to insert; null before appends under that parent. Create parents before children. move_task changes outline location without changing identity. A task with children is a summary: its dates, duration, work, and mode are calculated from descendants; never set those values or assign resources to it. A leaf with zero duration is a milestone.
+
+SCHEDULE RELATIONSHIPS
+target is the successor (the task being constrained); predecessor is the task it depends on. kind options: FS = successor starts after predecessor finishes; SS = starts after predecessor starts; FF = finishes after predecessor finishes; SF = finishes after predecessor starts. Omitted kind defaults to FS. lag is signed: positive delays, negative is a lead, zero means no offset. Omitted unit defaults to working days (d). Working units m/h/d/w/mo mean minutes/hours/days/weeks/months (1 day=8 hours, 1 week=5 days, 1 month=20 days). Elapsed units em/eh/ed/ew/emo mean elapsed minutes/hours/days/weeks/months (24-hour days, 7-day weeks, 30-day months). Unit % is a percentage of predecessor working duration. Add only links implied by the request; do not invent sequencing. A summary may be a predecessor for any link type, using rolled-up dates. A link to a summary supports only FS or SS and acts as a start floor on every leaf beneath it; do not create FF/SF links to a summary. Remove an existing link before replacing it; duplicate links between the same task pair are unsupported.
+
+TASK MODES AND RESOURCES
+duration means duration_days is the input and work is calculated; work means work_hours is the input and needs a positive resource assignment. Both are valid modes for new tasks. New tasks default to one working day in duration mode. On an existing imported fixed-units task, preserve its mode; duration can be edited but do not switch it to units explicitly. When switching between duration and work, supply the corresponding duration_days or work_hours. Durations are working days; work is hours; resource capacity and assignment units are percentages. Assignments are per-task percentages and may produce overallocation warnings; the scheduler does not level resources. Do not use legacy_resource values for AI assignment edits.
+
+OPERATION GUIDE
+- update_project changes name, start_date, or holidays. Supplying holidays replaces the whole list. A holiday is YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD, optionally followed by a name; entries cannot overlap. working_days in the snapshot are read-only (standard hours apply even on weekend dates).
+- create_task uses temp_id, name, parent, before, duration_days, earliest, mode, work_hours, estimated. Use a unique new-task:<short-id> temp_id. earliest is a date, not a time; an empty string clears it. Leave summary fields unset. The application clears estimates on created tasks and tasks whose duration/work it changes; preserve unrelated estimate marks unless explicitly asked to change one.
+- update_task uses target and only requested editable fields (name, duration_days, earliest, mode, work_hours, estimated). Never edit calculated summary fields. move_task uses target, parent, before. delete_task uses target; it also deletes descendants and removes their links.
+- create_resource uses temp_id, name, capacity (defaults to 100%). update_resource uses target, name, capacity. delete_resource uses target, but first unassign it from every task.
+- assign_resource uses target task, resource ref, units percentage. unassign_resource uses target task and resource ref. Do not assign a summary task.
+- add_dependency uses target successor, predecessor ref, kind, lag, unit. remove_dependency uses target successor and predecessor ref.
+
+Never invent existing IDs. Refer to existing items only by stable task:<id> and resource:<id> refs from the snapshot, not display_id. For new items use unique new-task:<id> or new-resource:<id> temp_id values and create them before referring to them. Create resources/tasks before assignments or links that refer to them. Do not change calculated start/finish dates, task completion, collapsed summary colors, unsupported constraints, resource calendars, or other unsupported project features. The shared calendar is Monday-Friday, 08:00-12:00 and 13:00-17:00, adjusted by holidays and working_days. The application validates and recalculates each proposal locally; the user must review it."""
+
+SYSTEM_PROMPT += "\n\n" + PROJECT_TEMPLATE_PROMPT
+
+
 def normalize_config(endpoint: str, deployment: str) -> FoundryConfig:
     if not isinstance(endpoint, str) or not isinstance(deployment, str):
         raise ProviderError("Enter the Foundry endpoint and deployment name.")
