@@ -8,11 +8,14 @@ import math
 from pathlib import Path
 import re
 import sys
+import time
 import unicodedata
 import zlib
 
-from PySide6.QtCore import QDate, QEvent, QLocale, QSize, QTime, Qt, QRectF, QTimer, QItemSelectionModel, QSettings
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPolygonF
+from PySide6.QtCore import (QDate, QEvent, QLocale, QObject, QSize, QTime, Qt, QRectF, QRunnable, QThreadPool,
+                            QTimer, QItemSelectionModel, QSettings, QUrl, Signal, Slot)
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen,
+                           QPolygonF)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
                                QFrame, QGroupBox, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -39,6 +42,8 @@ from .clipboard import clear_cut, get_rows, paste_rows, put_rows, release_rows
 from .ai.proposals import ProposalError, plan_revision
 from .ai.preview import CHANGED_CELL, ROW_COLORS, build_preview
 from .ai.ui import AIAssistantDock
+from .updates import (DEFAULT_AUTO_CHECK, DEFAULT_UPDATE_INTERVAL, UPDATE_INTERVALS, UpdateCheckError, UpdateInfo,
+                      fetch_latest_release, supported_target)
 
 
 DATE_FORMATS = ("system", "short", "long")
@@ -48,6 +53,32 @@ TASK_COLUMN_KEYS = ("id", "task", "duration", "start", "finish", "predecessors",
 COLUMN_WIDTH_KEY = "display/task_column_widths"
 OPTIONAL_COLUMNS = (("finish", "Finish"), ("predecessors", "Predecessors"), ("resource", "Resource"),
                     ("work", "Work"), ("mode", "Mode"), ("complete", "Complete"))
+
+
+class UpdateCheckSignals(QObject):
+    completed = Signal(object, object)
+    failed = Signal(object, str)
+
+
+class UpdateCheckWorker(QRunnable):
+    """Fetch release metadata without blocking the Qt event loop."""
+
+    def __init__(self, target, current_version):
+        super().__init__()
+        self.target = target
+        self.current_version = current_version
+        self.signals = UpdateCheckSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            info = fetch_latest_release(self.current_version, self.target)
+        except UpdateCheckError as exc:
+            self.signals.failed.emit(self, str(exc))
+        except Exception:
+            self.signals.failed.emit(self, "The update check failed unexpectedly.")
+        else:
+            self.signals.completed.emit(self, info)
 SUMMARY_PALETTE = (
     "#c9def2", "#9fc8e7", "#76add8", "#4c91c5",
     "#cce8d6", "#a4d5b6", "#77bf91", "#4a9e6a",
@@ -609,10 +640,11 @@ class TaskDialog(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, plan: Plan, parent=None, digit_edits_duration=True, date_format="system",
                  show_icon_labels=False, settings_location="", confirm_task_deletion=True, density=DEFAULT_DENSITY,
-                 visible_columns=None, color_collapsed_summaries=True):
+                 visible_columns=None, color_collapsed_summaries=True, update_checks_enabled=DEFAULT_AUTO_CHECK,
+                 update_interval=DEFAULT_UPDATE_INTERVAL, update_status="Not checked yet.", check_updates_callback=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(700, 600)
+        self.resize(700, 680)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("QTabWidget::pane { background: palette(window); }")
@@ -677,12 +709,37 @@ class SettingsDialog(QDialog):
         self.color_collapsed_summaries.setChecked(color_collapsed_summaries)
         self.color_collapsed_summaries.setToolTip("Similar task names use related colors. Expanded summaries remain black.")
         form.addRow("Gantt", self.color_collapsed_summaries)
+        self.update_checks_enabled = QCheckBox("Check for updates automatically")
+        self.update_checks_enabled.setChecked(update_checks_enabled)
+        self.update_checks_enabled.setToolTip("OnePyProject contacts GitHub for release metadata only; project data is never sent.")
+        form.addRow("Updates", self.update_checks_enabled)
+        self.update_interval = QComboBox()
+        self.update_interval.addItem("Daily", "daily")
+        self.update_interval.addItem("Weekly", "weekly")
+        self.update_interval.addItem("Monthly", "monthly")
+        self.update_interval.setCurrentIndex(max(0, self.update_interval.findData(update_interval)))
+        form.addRow("Check interval", self.update_interval)
+        self.update_interval.setEnabled(update_checks_enabled)
+        self.update_checks_enabled.toggled.connect(self.update_interval.setEnabled)
+        self.update_status = QLabel(update_status)
+        self.update_status.setWordWrap(True)
+        self.check_updates_button = QPushButton("Check now")
+        self.open_release_button = QPushButton("View release")
+        self.open_release_button.setVisible(False)
+        self.check_updates_button.clicked.connect(check_updates_callback or (lambda: None))
+        self.open_release_button.clicked.connect(self.open_release_page)
+        update_buttons = QHBoxLayout()
+        update_buttons.addWidget(self.check_updates_button)
+        update_buttons.addWidget(self.open_release_button)
+        update_buttons.addStretch()
         self.settings_location = QLineEdit(settings_location)
         self.settings_location.setReadOnly(True)
         self.settings_location.setCursorPosition(0)
         self.settings_location.setToolTip("Application preferences are stored separately from the project file.\n" + settings_location)
         form.addRow("Preferences location", self.settings_location)
         preferences_layout.addLayout(form)
+        preferences_layout.addWidget(self.update_status)
+        preferences_layout.addLayout(update_buttons)
         visibility = QGroupBox("Optional task columns")
         visibility_grid = QGridLayout(visibility)
         visible_columns = visible_columns or {}
@@ -700,6 +757,16 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._release_url = None
+
+    def set_update_status(self, message, release_url=None):
+        self.update_status.setText(message)
+        self._release_url = release_url
+        self.open_release_button.setVisible(bool(release_url))
+
+    def open_release_page(self):
+        if self._release_url:
+            QDesktopServices.openUrl(QUrl(self._release_url))
 
 
 class ExportDialog(QFileDialog):
@@ -1097,6 +1164,13 @@ class MainWindow(QMainWindow):
         if self.date_format not in DATE_FORMATS:
             self.date_format = "system"
         self.density = read_density_preference(self.preferences)
+        self.update_checks_enabled = self.preferences.value("updates/enabled", DEFAULT_AUTO_CHECK, type=bool)
+        self.update_interval = self.preferences.value("updates/interval", DEFAULT_UPDATE_INTERVAL, type=str)
+        if self.update_interval not in UPDATE_INTERVALS:
+            self.update_interval = DEFAULT_UPDATE_INTERVAL
+        self._update_check_in_progress = False
+        self._update_workers = set()
+        self._active_settings_dialog = None
         self.plan = Plan()
         self.calculated = {}
         self.items: dict[int, QTreeWidgetItem] = {}
@@ -1288,6 +1362,10 @@ class MainWindow(QMainWindow):
         self._column_width_sync.setInterval(300)
         self._column_width_sync.timeout.connect(self.sync_preferences)
         header.sectionResized.connect(self.save_column_width)
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setSingleShot(True)
+        self._update_check_timer.timeout.connect(self._run_scheduled_update_check)
+        QTimer.singleShot(5000, self._schedule_update_check)
         if preferences is None and self.preferences.status() != QSettings.Status.NoError:
             QTimer.singleShot(0, self.sync_preferences)
 
@@ -1972,10 +2050,113 @@ class MainWindow(QMainWindow):
             return list(current)
         return [format_period(period) for period in parse_periods(text)]
 
+    def _update_status_text(self):
+        last_check = self.preferences.value("updates/last_check_epoch", 0, type=int)
+        status = self.preferences.value("updates/last_status", "Not checked yet.", type=str)
+        if not last_check:
+            return status
+        timestamp = datetime.fromtimestamp(last_check).astimezone().strftime("%Y-%m-%d %H:%M")
+        return f"Last checked {timestamp}: {status}"
+
+    def _schedule_update_check(self):
+        self._update_check_timer.stop()
+        if len(sys.argv) > 1 and sys.argv[1] == "--packaging-smoke-test":
+            return
+        if not self.update_checks_enabled or not getattr(sys, "frozen", False):
+            return
+        if supported_target() is None:
+            return
+        interval_seconds = UPDATE_INTERVALS[self.update_interval] * 24 * 60 * 60
+        last_check = self.preferences.value("updates/last_check_epoch", 0, type=int)
+        delay_ms = max(1000, int((last_check + interval_seconds - time.time()) * 1000))
+        self._update_check_timer.start(delay_ms)
+
+    def _run_scheduled_update_check(self):
+        self._start_update_check(manual=False)
+
+    def _manual_update_check(self):
+        if not getattr(sys, "frozen", False):
+            if self._active_settings_dialog is not None:
+                self._active_settings_dialog.set_update_status("Update checks are available in packaged releases.")
+            return
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual):
+        target = supported_target()
+        if target is None:
+            message = "No update package is available for this operating system or processor yet."
+            if self._active_settings_dialog is not None:
+                self._active_settings_dialog.set_update_status(message)
+            elif manual:
+                QMessageBox.information(self, "Check for updates", message)
+            return
+        if self._update_check_in_progress:
+            if self._active_settings_dialog is not None:
+                self._active_settings_dialog.set_update_status("Checking for updates…")
+            return
+
+        self._update_check_in_progress = True
+        self.preferences.setValue("updates/last_check_epoch", int(time.time()))
+        self.preferences.sync()
+        if self._active_settings_dialog is not None:
+            self._active_settings_dialog.set_update_status("Checking for updates…")
+            self._active_settings_dialog.check_updates_button.setEnabled(False)
+
+        worker = UpdateCheckWorker(target, __version__)
+        worker.manual = manual
+        worker.signals.completed.connect(self._update_check_completed)
+        worker.signals.failed.connect(self._update_check_failed)
+        self._update_workers.add(worker)
+        QThreadPool.globalInstance().start(worker)
+
+    def _update_check_completed(self, worker, info):
+        self._update_workers.discard(worker)
+        self._update_check_in_progress = False
+        status = f"Version {info.version} is available." if info else f"You're up to date ({__version__})."
+        self.preferences.setValue("updates/last_status", status)
+        self.preferences.sync()
+        self._schedule_update_check()
+
+        dialog = self._active_settings_dialog
+        if dialog is not None:
+            dialog.check_updates_button.setEnabled(True)
+            dialog.set_update_status(status, info.page_url if info else None)
+            return
+        if worker.manual and info is None:
+            QMessageBox.information(self, "Check for updates", status)
+        elif info is not None:
+            self._show_update_available(info)
+
+    def _update_check_failed(self, worker, _details):
+        self._update_workers.discard(worker)
+        self._update_check_in_progress = False
+        status = "Could not check for updates. Check your connection and try again."
+        self.preferences.setValue("updates/last_status", status)
+        self.preferences.sync()
+        self._schedule_update_check()
+        if self._active_settings_dialog is not None:
+            self._active_settings_dialog.check_updates_button.setEnabled(True)
+            self._active_settings_dialog.set_update_status(status)
+        elif worker.manual:
+            QMessageBox.warning(self, "Check for updates", status)
+
+    def _show_update_available(self, info: UpdateInfo):
+        box = QMessageBox(QMessageBox.Icon.Information, "Update available",
+                          f"OnePyProject {info.version} is available. You have {__version__}.",
+                          QMessageBox.StandardButton.Close, self)
+        view_button = box.addButton("View release", QMessageBox.ButtonRole.AcceptRole)
+        if info.release_notes:
+            box.setDetailedText(info.release_notes)
+        box.exec()
+        if box.clickedButton() is view_button:
+            QDesktopServices.openUrl(QUrl(info.page_url))
+
     def settings(self):
         dialog = SettingsDialog(self.plan, self, self.digit_edits_duration, self.date_format,
                                 self.show_icon_labels, self.preferences.fileName(), self.confirm_task_deletion, self.density,
-                                self.visible_task_columns, self.color_collapsed_summaries)
+                                self.visible_task_columns, self.color_collapsed_summaries, self.update_checks_enabled,
+                                self.update_interval, self._update_status_text(), self._manual_update_check)
+        self._active_settings_dialog = dialog
         if dialog.exec() == QDialog.DialogCode.Accepted:
             def update():
                 self.plan.title = dialog.title.text().strip() or "Untitled project"
@@ -1987,6 +2168,8 @@ class MainWindow(QMainWindow):
                 self.confirm_task_deletion = dialog.confirm_task_deletion.isChecked()
                 self.show_icon_labels = dialog.show_icon_labels.isChecked()
                 self.color_collapsed_summaries = dialog.color_collapsed_summaries.isChecked()
+                self.update_checks_enabled = dialog.update_checks_enabled.isChecked()
+                self.update_interval = dialog.update_interval.currentData()
                 self.visible_task_columns = {key: checkbox.isChecked()
                                              for key, checkbox in dialog.column_visibility.items()}
                 previous_density = self.density
@@ -1999,9 +2182,12 @@ class MainWindow(QMainWindow):
                 self.preferences.setValue("display/show_icon_labels", self.show_icon_labels)
                 self.preferences.setValue("display/date_format", self.date_format)
                 self.preferences.setValue("display/color_collapsed_summaries", self.color_collapsed_summaries)
+                self.preferences.setValue("updates/enabled", self.update_checks_enabled)
+                self.preferences.setValue("updates/interval", self.update_interval)
                 for key, visible in self.visible_task_columns.items():
                     self.preferences.setValue(f"display/task_column_visibility/{key}", visible)
                 self.sync_preferences()
+                self._schedule_update_check()
                 self.apply_toolbar_labels()
                 self.apply_column_visibility()
                 self.gantt.update()
@@ -2009,6 +2195,7 @@ class MainWindow(QMainWindow):
                     self.apply_density()
                 if self.date_format != previous_date_format:
                     self.refresh()
+        self._active_settings_dialog = None
 
     def manage_resources(self):
         dialog = ResourceSheetDialog(self.plan, self, density=self.density)

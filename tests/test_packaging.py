@@ -26,6 +26,30 @@ def test_packaging_targets_exclude_macos_intel():
     assert packaging.TARGETS == ("macos-arm64", "windows-x64")
 
 
+def test_package_asset_names_follow_the_update_release_contract():
+    assert packaging.release_asset_name("0.2.1", "macos-arm64") == "OnePyProject-0.2.1-macos-arm64.dmg"
+    assert packaging.release_asset_name("0.2.1", "windows-x64") == "OnePyProject-0.2.1-windows-x64.zip"
+
+
+def test_macos_dmg_includes_applications_shortcut_and_drag_instructions(tmp_path, monkeypatch):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "OnePyProject.app").mkdir()
+    archive = tmp_path / "OnePyProject.dmg"
+    calls = []
+    monkeypatch.setattr(packaging.subprocess, "run", lambda args, **kwargs: calls.append((args, kwargs)))
+
+    packaging.make_macos_dmg(stage, archive, tmp_path)
+
+    image_source = tmp_path / "dmg-source"
+    assert (image_source / "Applications").is_symlink()
+    assert (image_source / "Applications").readlink() == Path("/Applications")
+    assert "Drag OnePyProject.app onto the Applications shortcut" in (image_source / "INSTALL.txt").read_text()
+    assert calls[0][0][:5] == ["hdiutil", "create", "-volname", "OnePyProject", "-srcfolder"]
+    assert calls[0][0][7:9] == ["-format", "UDZO"]
+    assert calls[0][1]["check"] is True
+
+
 @pytest.mark.parametrize("filename", ["template.MPP", "other.Mpt", "personal.PxPlan"])
 def test_package_rejects_personal_projects(tmp_path, filename):
     bundle = make_fake_bundle(tmp_path / "bundle")
