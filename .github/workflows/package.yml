@@ -8,7 +8,6 @@ permissions:
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45

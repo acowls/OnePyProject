@@ -105,10 +105,12 @@ def collect_bundled_python_licenses(bundle, license_root):
         if not texts:
             normalized_name = name.casefold().replace("_", "-")
             if normalized_name == "onepyproject":
-                own_license = bundle / "Contents" / "Resources" / "LICENSE"
-                if not own_license.is_file():
-                    own_license = bundle / "LICENSE"
-                if not own_license.is_file():
+                own_license = next((path for path in (
+                    bundle / "Contents" / "Resources" / "LICENSE",
+                    bundle / "_internal" / "LICENSE",
+                    bundle / "LICENSE",
+                ) if path.is_file()), None)
+                if own_license is None:
                     raise RuntimeError("The app's MIT license is missing from the frozen bundle")
                 texts = [own_license]
             elif normalized_name in {"pyside6-essentials", "shiboken6"}:
@@ -365,7 +367,7 @@ def make_macos_dmg(stage, archive, temporary):
     (image_source / "Applications").symlink_to("/Applications", target_is_directory=True)
     (image_source / "INSTALL.txt").write_text(
         "Drag OnePyProject.app onto the Applications shortcut to install it.\n"
-        "This build is unsigned; macOS security warnings are expected.\n",
+        "This app is ad-hoc signed, not Developer ID-signed or notarized; macOS security warnings are expected.\n",
         encoding="utf-8",
     )
     subprocess.run([
@@ -388,6 +390,8 @@ def smoke_test_macos_dmg(archive, temporary, app_name):
         if (mountpoint / "INSTALL.txt").read_text(encoding="utf-8").find("Drag OnePyProject.app") < 0:
             raise RuntimeError("The macOS disk image is missing its install instructions")
         check_tree(application)
+        verify_macos_bundle_signature(application)
+        verify_native_inventory(application, mountpoint / "BUNDLED_NATIVE_COMPONENTS.json")
         smoke_test(application / "Contents" / "MacOS" / "OnePyProject")
     finally:
         subprocess.run(["hdiutil", "detach", str(mountpoint), "-quiet"], check=True, capture_output=True)
@@ -479,17 +483,13 @@ def make_artifact(target, dist, output):
             extracted.mkdir()
             with zipfile.ZipFile(archive) as input_zip:
                 input_zip.extractall(extracted)
-        extracted_stage = extracted / name
-        check_tree(extracted_stage)
-        if expected_system == "Darwin":
-            verify_macos_bundle_signature(extracted_stage / app_name)
-        verify_native_inventory(
-            extracted_stage / app_name,
-            extracted_stage / "BUNDLED_NATIVE_COMPONENTS.json",
-        )
-        executable = (extracted_stage / app_name / "Contents" / "MacOS" / "OnePyProject"
-                      if expected_system == "Darwin" else extracted_stage / app_name / "OnePyProject.exe")
-        smoke_test(executable)
+            extracted_stage = extracted / name
+            check_tree(extracted_stage)
+            verify_native_inventory(
+                extracted_stage / app_name,
+                extracted_stage / "BUNDLED_NATIVE_COMPONENTS.json",
+            )
+            smoke_test(extracted_stage / app_name / "OnePyProject.exe")
     print(f"Validated {archive}")
 
 
