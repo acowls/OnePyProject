@@ -223,6 +223,12 @@ def test_history_prompt_and_cached_tokens_are_sent_and_reported():
     assert "Prefer milestones" in calls["messages"][0]["content"]
     assert "The project snapshot" in calls["messages"][0]["content"]
     assert "@Craig" in calls["messages"][0]["content"] and "stable resource reference" in calls["messages"][0]["content"]
+    system_prompt = calls["messages"][0]["content"]
+    assert "PROJECT-PLANNING TEMPLATE" in system_prompt
+    assert "not an alternate response format" in system_prompt
+    assert "target is the successor" in system_prompt and "predecessor is the task it depends on" in system_prompt
+    assert "kind options: FS = successor starts" in system_prompt
+    assert "A link to a summary supports only FS or SS" in system_prompt
     assert calls["reasoning_effort"] == "high"
     assert result.prompt_tokens == 90 and result.completion_tokens == 10 and result.cached_prompt_tokens == 25
 

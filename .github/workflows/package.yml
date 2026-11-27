@@ -44,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: OnePyProject-${{ github.sha }}-${{ matrix.target }}
-          path: artifacts/*.zip
+          path: artifacts/*
           if-no-files-found: error
           retention-days: 7
 
@@ -66,4 +66,4 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: artifacts/*.zip
+          subject-path: artifacts/*

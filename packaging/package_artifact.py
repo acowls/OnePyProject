@@ -18,6 +18,10 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from onepyproject.updates import release_asset_name
+
 VERSION = runpy.run_path(str(ROOT / "onepyproject" / "__init__.py"))["__version__"]
 TARGETS = ("macos-arm64", "windows-x64")
 PRIVATE_EXTENSIONS = {".mpp", ".mpt", ".pxplan"}
@@ -354,6 +358,41 @@ def smoke_test(executable):
         print(details.strip())
 
 
+def make_macos_dmg(stage, archive, temporary):
+    """Create a drag-to-Applications disk image from a validated app bundle."""
+    image_source = temporary / "dmg-source"
+    shutil.copytree(stage, image_source, symlinks=True)
+    (image_source / "Applications").symlink_to("/Applications", target_is_directory=True)
+    (image_source / "INSTALL.txt").write_text(
+        "Drag OnePyProject.app onto the Applications shortcut to install it.\n"
+        "This build is unsigned; macOS security warnings are expected.\n",
+        encoding="utf-8",
+    )
+    subprocess.run([
+        "hdiutil", "create", "-volname", "OnePyProject", "-srcfolder", str(image_source),
+        "-ov", "-format", "UDZO", str(archive),
+    ], check=True)
+
+
+def smoke_test_macos_dmg(archive, temporary, app_name):
+    """Mount the generated image read-only and exercise the app from it."""
+    mountpoint = temporary / "mounted-dmg"
+    mountpoint.mkdir()
+    subprocess.run([
+        "hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", str(mountpoint), str(archive),
+    ], check=True, capture_output=True)
+    try:
+        application = mountpoint / app_name
+        if not (mountpoint / "Applications").is_symlink():
+            raise RuntimeError("The macOS disk image is missing its Applications shortcut")
+        if (mountpoint / "INSTALL.txt").read_text(encoding="utf-8").find("Drag OnePyProject.app") < 0:
+            raise RuntimeError("The macOS disk image is missing its install instructions")
+        check_tree(application)
+        smoke_test(application / "Contents" / "MacOS" / "OnePyProject")
+    finally:
+        subprocess.run(["hdiutil", "detach", str(mountpoint), "-quiet"], check=True, capture_output=True)
+
+
 def make_artifact(target, dist, output):
     expected_system = "Darwin" if target.startswith("macos-") else "Windows"
     expected_machine = "arm64" if target.endswith("arm64") else "x64"
@@ -362,9 +401,10 @@ def make_artifact(target, dist, output):
     if platform.system() != expected_system or actual_machine != expected_machine:
         raise RuntimeError(f"Target {target} does not match {platform.system()} {machine}")
 
-    name = f"OnePyProject-{VERSION}-{target}"
+    asset_name = release_asset_name(VERSION, target)
+    name = Path(asset_name).stem
     output.mkdir(parents=True, exist_ok=True)
-    archive = (output / f"{name}.zip").resolve()
+    archive = (output / asset_name).resolve()
     app_name = "OnePyProject.app" if expected_system == "Darwin" else "OnePyProject"
     with tempfile.TemporaryDirectory(prefix="onepyproject-package-") as temporary:
         temporary = Path(temporary)
@@ -428,19 +468,15 @@ def make_artifact(target, dist, output):
             shutil.copyfile(stage / "BUNDLED_NATIVE_COMPONENTS.json", bundle / "BUNDLED_NATIVE_COMPONENTS.json")
         check_tree(stage)
         if expected_system == "Darwin":
-            # GitHub's artifact ZIP does not preserve app symlinks/executable bits.
-            subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(stage), str(archive)], check=True)
+            make_macos_dmg(stage, archive, temporary)
+            smoke_test_macos_dmg(archive, temporary, app_name)
         else:
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output_zip:
                 for path in stage.rglob("*"):
                     if path.is_file():
                         output_zip.write(path, path.relative_to(temporary))
-
-        extracted = temporary / "extracted"
-        extracted.mkdir()
-        if expected_system == "Darwin":
-            subprocess.run(["ditto", "-x", "-k", str(archive), str(extracted)], check=True)
-        else:
+            extracted = temporary / "extracted"
+            extracted.mkdir()
             with zipfile.ZipFile(archive) as input_zip:
                 input_zip.extractall(extracted)
         extracted_stage = extracted / name
