@@ -147,6 +147,24 @@ def test_bundle_inventory_includes_editable_project_egg_info(tmp_path):
     assert (tmp_path / "stage" / packages[0]["license_files"][0]).read_text(encoding="utf-8") == "MIT app license\n"
 
 
+def test_bundle_inventory_finds_windows_app_license_in_internal_directory(tmp_path):
+    bundle = tmp_path / "OnePyProject"
+    info = bundle / "_internal" / "onepyproject.egg-info"
+    info.mkdir(parents=True)
+    (info / "PKG-INFO").write_text(
+        "Metadata-Version: 2.1\nName: OnePyProject\nVersion: 0.2.1\nLicense: MIT\n",
+        encoding="utf-8",
+    )
+    (bundle / "_internal" / "LICENSE").write_text("MIT app license\n", encoding="utf-8")
+    license_root = tmp_path / "stage" / "licenses"
+
+    packages = packaging.collect_bundled_python_licenses(bundle, license_root)
+
+    assert packages[0]["license"] == "MIT"
+    path = tmp_path / "stage" / packages[0]["license_files"][0]
+    assert path.read_text(encoding="utf-8") == "MIT app license\n"
+
+
 def test_native_inventory_records_hashes_for_mach_o_files(tmp_path):
     bundle = tmp_path / "bundle"
     binary = bundle / "Contents" / "Frameworks" / "PySide6" / "Qt" / "lib" / "QtCore.dylib"
