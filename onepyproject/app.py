@@ -1308,7 +1308,8 @@ class MainWindow(QMainWindow):
         duration_width = header_metrics.horizontalAdvance("Duration") + 14
         date_width = max(data_metrics.horizontalAdvance("2020-08-08"), header_metrics.horizontalAdvance("Finish")) + 12
         work_width = max(data_metrics.horizontalAdvance("888 h"), header_metrics.horizontalAdvance("Work")) + 12
-        for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90, 82)):
+        complete_width = max(data_metrics.horizontalAdvance("100.0%"), header_metrics.horizontalAdvance("Complete")) + 14
+        for i, width in enumerate((48, 250, duration_width, date_width, date_width, 130, 110, work_width, 90, complete_width)):
             value = self.preferences.value(f"{COLUMN_WIDTH_KEY}/{TASK_COLUMN_KEYS[i]}", None)
             if isinstance(value, int) and not isinstance(value, bool):
                 saved_width = value

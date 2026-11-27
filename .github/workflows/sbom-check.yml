@@ -57,24 +57,26 @@ jobs:
         include:
           - target: macos-arm64
             runner: macos-15
-            app_dir: OnePyProject.app
+            asset_extension: dmg
           - target: windows-x64
             runner: windows-2022
-            app_dir: OnePyProject
+            asset_extension: zip
     steps:
-      - name: Download the selected release ZIP
+      - name: Download the selected release artifact
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
           TARGET: ${{ matrix.target }}
+          ASSET_EXTENSION: ${{ matrix.asset_extension }}
         shell: bash
         run: |
           set -euo pipefail
-          archive="OnePyProject-$RELEASE_VERSION-$TARGET.zip"
+          archive="OnePyProject-$RELEASE_VERSION-$TARGET.$ASSET_EXTENSION"
           mkdir -p downloads
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir downloads
-      - name: Extract macOS app bundle
+      - name: Mount macOS disk image
+        id: extract-macos
         if: matrix.target == 'macos-arm64'
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
@@ -82,9 +84,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release-app
-          ditto -x -k "downloads/OnePyProject-$RELEASE_VERSION-$TARGET.zip" release-app
+          mkdir -p release-app/mounted
+          hdiutil attach -readonly -nobrowse -mountpoint release-app/mounted \
+            "downloads/OnePyProject-$RELEASE_VERSION-$TARGET.dmg"
+          echo "app_path=release-app/mounted/OnePyProject.app" >> "$GITHUB_OUTPUT"
       - name: Extract Windows app directory
+        id: extract-windows
         if: matrix.target == 'windows-x64'
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
@@ -95,16 +100,22 @@ jobs:
           $archive = "downloads/OnePyProject-{0}-{1}.zip" -f $env:RELEASE_VERSION, $env:TARGET
           New-Item -ItemType Directory -Force -Path release-app | Out-Null
           Expand-Archive -Path $archive -DestinationPath release-app -Force
+          $appPath = "release-app/OnePyProject-{0}-{1}/OnePyProject" -f $env:RELEASE_VERSION, $env:TARGET
+          "app_path=$appPath" >> $env:GITHUB_OUTPUT
       - name: Generate SPDX 2.3 SBOM from the release bundle
         uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
-          path: release-app/OnePyProject-${{ needs.verify-release.outputs.version }}-${{ matrix.target }}/${{ matrix.app_dir }}
+          path: ${{ steps.extract-macos.outputs.app_path || steps.extract-windows.outputs.app_path }}
           format: spdx-json
           output-file: OnePyProject-${{ inputs.tag }}-${{ matrix.target }}.spdx.json
           artifact-name: OnePyProject-${{ inputs.tag }}-${{ matrix.target }}-SBOM
           syft-version: v1.57.2
           upload-artifact: true
           upload-release-assets: false
+      - name: Detach macOS disk image
+        if: always() && matrix.target == 'macos-arm64'
+        shell: bash
+        run: hdiutil detach release-app/mounted -quiet || true
 
   attach-sboms:
     name: Attach SBOMs to release
