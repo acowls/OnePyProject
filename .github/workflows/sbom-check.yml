@@ -139,6 +139,19 @@ jobs:
         run: |
           set -euo pipefail
           cd sboms
-          sha256sum *.spdx.json > SBOM-SHA256SUMS.txt
-          gh release upload "$RELEASE_TAG" *.spdx.json SBOM-SHA256SUMS.txt \
+          sbom_files=()
+          for target in macos-arm64 windows-x64; do
+            artifact="OnePyProject-${RELEASE_TAG}-${target}-SBOM"
+            asset="OnePyProject-${RELEASE_TAG}-${target}.spdx.json"
+            source="$(find . -type f \( -name "$artifact" -o -name "$asset" \) -print -quit)"
+            test -n "$source"
+            test -s "$source"
+            jq -e '.spdxVersion == "SPDX-2.3"' "$source" >/dev/null
+            if [[ "$source" != "./$asset" && "$source" != "$asset" ]]; then
+              cp "$source" "$asset"
+            fi
+            sbom_files+=("$asset")
+          done
+          sha256sum "${sbom_files[@]}" > SBOM-SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" "${sbom_files[@]}" SBOM-SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --clobber
